@@ -39,6 +39,20 @@ public:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
 
+    // Parameters for the WiFi tool background tasks. The scan and the connect
+    // run in their own FreeRTOS task and send the MCP reply later through
+    // McpServer::SendReply, so they carry the reply id with them.
+    struct WifiScanTaskParam {
+        MyBoard* self;
+        int reply_id;
+    };
+
+    struct WifiConnectTaskParam {
+        int reply_id;
+        std::string ssid;
+        std::string password;
+    };
+
     void InitializePowerManager() {
         power_manager_ = new PowerManager(GPIO_NUM_38);
         power_manager_->OnChargingStatusChanged([this](bool is_charging) {
@@ -175,12 +189,348 @@ public:
         InitializeTools();
     }
 
-    // The board's custom MCP tools (WiFi scan/connect/save/forget, packet
-    // sniffer, DNS log and memory info) have been removed. The only custom
-    // tool left is the market notifier, a C++ port of
+    // Background task for self.wifi.scan_networks: runs a blocking WiFi scan
+    // off the main task and posts the JSON result back to the MCP client.
+    static void WifiScanTask(void* param) {
+        auto* p = static_cast<WifiScanTaskParam*>(param);
+        auto* self = p->self;
+        int captured_id = p->reply_id;
+        delete p;
+
+        auto display = self->GetDisplay();
+        auto& wifi_mgr = WifiManager::GetInstance();
+
+        display->SetChatMessage("system", "Scanning WiFi...");
+        ESP_LOGI(TAG, "Background scan task started on core %d, priority %d", xPortGetCoreID(), uxTaskPriorityGet(nullptr));
+
+        wifi_mgr.SetExternalScanMode(true);
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        vTaskDelay(pdMS_TO_TICKS(500));
+
+        uint16_t ap_count = 0;
+        wifi_ap_record_t* ap_records = nullptr;
+
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            wifi_scan_config_t scan_config = {};
+            scan_config.show_hidden = false;
+            scan_config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+            scan_config.scan_time.active.min = 100;
+            scan_config.scan_time.active.max = 300;
+
+            esp_err_t err = esp_wifi_scan_start(&scan_config, true);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "scan_start failed: %s", esp_err_to_name(err));
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                continue;
+            }
+
+            esp_wifi_scan_get_ap_num(&ap_count);
+            ESP_LOGI(TAG, "Attempt %d: found %d APs", attempt, ap_count);
+
+            if (ap_count > 0) {
+                ap_records = new wifi_ap_record_t[ap_count];
+                esp_wifi_scan_get_ap_records(&ap_count, ap_records);
+                break;
+            }
+
+            if (attempt < 3) vTaskDelay(pdMS_TO_TICKS(1500));
+        }
+
+        wifi_mgr.SetExternalScanMode(false);
+        esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+
+        cJSON* root = cJSON_CreateArray();
+        std::string summary;
+        int displayed = 0;
+
+        if (ap_records) {
+            for (int i = 0; i < ap_count; i++) {
+                std::string ssid = reinterpret_cast<char*>(ap_records[i].ssid);
+                if (ssid.empty()) continue;
+
+                ESP_LOGI(TAG, "  [%d] SSID=%s RSSI=%d AUTH=%d",
+                         i, ssid.c_str(), ap_records[i].rssi, ap_records[i].authmode);
+
+                cJSON* net = cJSON_CreateObject();
+                cJSON_AddStringToObject(net, "ssid", ssid.c_str());
+                cJSON_AddNumberToObject(net, "rssi", ap_records[i].rssi);
+
+                const char* auth = "open";
+                if (ap_records[i].authmode == WIFI_AUTH_WEP) auth = "wep";
+                else if (ap_records[i].authmode == WIFI_AUTH_WPA_PSK) auth = "wpa";
+                else if (ap_records[i].authmode == WIFI_AUTH_WPA2_PSK) auth = "wpa2";
+                else if (ap_records[i].authmode == WIFI_AUTH_WPA3_PSK) auth = "wpa3";
+                else if (ap_records[i].authmode == WIFI_AUTH_WPA_WPA2_PSK) auth = "wpa/wpa2";
+                cJSON_AddStringToObject(net, "auth", auth);
+                cJSON_AddItemToArray(root, net);
+
+                if (displayed < 8) {
+                    if (!summary.empty()) summary += ", ";
+                    summary += ssid;
+                    summary += " (";
+                    summary += std::to_string(ap_records[i].rssi);
+                    summary += "dBm)";
+                }
+                displayed++;
+            }
+            delete[] ap_records;
+
+            if (displayed > 8) {
+                summary += " + " + std::to_string(displayed - 8) + " more";
+            }
+        }
+
+        char msg[128];
+        snprintf(msg, sizeof(msg), "Found %d networks", ap_count);
+        display->SetChatMessage("system", msg);
+        ESP_LOGI(TAG, "Scan complete: %s", msg);
+
+        if (summary.empty()) summary = "No WiFi networks found";
+
+        char* json_str = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+
+        cJSON* wrapper = cJSON_CreateObject();
+        cJSON* content = cJSON_CreateArray();
+        cJSON* text = cJSON_CreateObject();
+        cJSON_AddStringToObject(text, "type", "text");
+        cJSON_AddStringToObject(text, "text", json_str);
+        cJSON_free(json_str);
+        cJSON_AddItemToArray(content, text);
+        cJSON_AddItemToObject(wrapper, "content", content);
+        cJSON_AddBoolToObject(wrapper, "isError", false);
+
+        char* wrapper_str = cJSON_PrintUnformatted(wrapper);
+        std::string result_str(wrapper_str);
+        cJSON_free(wrapper_str);
+        cJSON_Delete(wrapper);
+
+        ESP_LOGI(TAG, "MCP reply payload: %s", result_str.c_str());
+        McpServer::GetInstance().SendReply(captured_id, result_str);
+        ESP_LOGI(TAG, "MCP reply sent for id=%d", captured_id);
+
+        vTaskDelete(nullptr);
+    }
+
+    // Background task for self.wifi.connect_network: saves the credentials,
+    // reconnects and reports success or a 15 second timeout.
+    static void WifiConnectTask(void* arg) {
+        auto* param = static_cast<WifiConnectTaskParam*>(arg);
+        int captured_id = param->reply_id;
+        std::string ssid = std::move(param->ssid);
+        std::string password = std::move(param->password);
+        delete param;
+
+        ESP_LOGI(TAG, "WiFi connect task started for SSID: %s", ssid.c_str());
+
+        auto& wifi_mgr = WifiManager::GetInstance();
+
+        // Save credentials to NVS
+        auto& ssid_manager = SsidManager::GetInstance();
+        ssid_manager.AddSsid(ssid, password);
+        ESP_LOGI(TAG, "Saved SSID to NVS: %s", ssid.c_str());
+
+        // Stop current connection and reconnect with new credentials
+        wifi_mgr.StopStation();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wifi_mgr.StartStation();
+
+        // Wait for connection with 15s timeout
+        auto start_time = xTaskGetTickCount();
+        const TickType_t timeout_ticks = pdMS_TO_TICKS(15000);
+        bool connected = false;
+
+        while ((xTaskGetTickCount() - start_time) < timeout_ticks) {
+            if (wifi_mgr.IsConnected()) {
+                connected = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        // Build MCP reply
+        cJSON* wrapper = cJSON_CreateObject();
+        cJSON* content = cJSON_CreateArray();
+        cJSON* text = cJSON_CreateObject();
+        cJSON_AddStringToObject(text, "type", "text");
+
+        if (connected) {
+            std::string msg = "Successfully connected to " + ssid + ".";
+            cJSON_AddStringToObject(text, "text", msg.c_str());
+            ESP_LOGI(TAG, "Connected to %s", ssid.c_str());
+        } else {
+            std::string msg = "Failed to connect to " + ssid + " within 15 seconds. "
+                              "Please check the password and try again, or use captive portal at http://192.168.4.1.";
+            cJSON_AddStringToObject(text, "text", msg.c_str());
+            ESP_LOGW(TAG, "Connection to %s timed out", ssid.c_str());
+        }
+
+        cJSON_AddItemToArray(content, text);
+        cJSON_AddItemToObject(wrapper, "content", content);
+        cJSON_AddBoolToObject(wrapper, "isError", !connected);
+
+        char* wrapper_str = cJSON_PrintUnformatted(wrapper);
+        std::string result_str(wrapper_str);
+        cJSON_free(wrapper_str);
+        cJSON_Delete(wrapper);
+
+        ESP_LOGI(TAG, "MCP reply payload: %s", result_str.c_str());
+        McpServer::GetInstance().SendReply(captured_id, result_str);
+        ESP_LOGI(TAG, "MCP reply sent for id=%d", captured_id);
+
+        vTaskDelete(nullptr);
+    }
+
+    // The board's custom MCP tools: the four WiFi network tools
+    // (scan/connect/save/forget) are restored unchanged from the original
+    // board, the packet sniffer, DNS log and memory info tools stay removed.
+    // The market notifier is a C++ port of
     // https://github.com/spartacus1988/Gold_and_crypto_notifyer (main.py).
     void InitializeTools() {
         auto &mcp_server = McpServer::GetInstance();
+        mcp_server.AddTool("self.wifi.scan_networks",
+            "Scan all available WiFi networks nearby and return the list.\n"
+            "Returns: A list of WiFi networks with SSID, signal strength (RSSI), and encryption type.\n"
+            "Use this tool when the user wants to see available WiFi networks or check WiFi signal.",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                auto& wifi_mgr = WifiManager::GetInstance();
+                int reply_id = McpServer::GetInstance().GetPendingToolCallId();
+
+                ESP_LOGI(TAG, "WiFi scan requested, reply_id=%d", reply_id);
+
+                if (!wifi_mgr.IsInitialized()) {
+                    return std::string("{\"error\":\"WiFi not initialized\"}");
+                }
+                if (wifi_mgr.IsConfigMode()) {
+                    return std::string("{\"error\":\"WiFi in config AP mode\"}");
+                }
+
+                auto* self = this;
+                int captured_id = reply_id;
+                McpServer::GetInstance().SetDeferredReply(true);
+                auto* param = new WifiScanTaskParam{self, captured_id};
+                xTaskCreatePinnedToCore(WifiScanTask, "wifi_scan", 8192, param, 24, nullptr, 0);
+
+                return std::string("WiFi scan in progress. Results will be announced shortly.");
+            });
+
+        mcp_server.AddTool("self.wifi.connect_network",
+            "Connect to a WiFi network.\n"
+            "Args:\n"
+            "  `ssid`: The name of the WiFi network to connect to.\n"
+            "  `password`: The password for the WiFi network (optional if already saved).\n"
+            "If the network was previously connected, the device already has the password saved and will connect automatically.\n"
+            "Only ask the user for the password if the network has never been connected before.",
+            PropertyList({
+                Property("ssid", kPropertyTypeString),
+                Property("password", kPropertyTypeString, std::string(""))
+            }),
+            [](const PropertyList& properties) -> ReturnValue {
+                auto& wifi_mgr = WifiManager::GetInstance();
+                int reply_id = McpServer::GetInstance().GetPendingToolCallId();
+                std::string ssid = properties["ssid"].value<std::string>();
+                std::string password = properties["password"].value<std::string>();
+
+                ESP_LOGI(TAG, "WiFi connect requested: ssid=%s, reply_id=%d", ssid.c_str(), reply_id);
+
+                if (!wifi_mgr.IsInitialized()) {
+                    return std::string("{\"error\":\"WiFi not initialized\"}");
+                }
+                if (ssid.empty()) {
+                    return std::string("{\"error\":\"SSID is required\"}");
+                }
+
+                bool used_saved = false;
+                // If no password provided, check if we have saved credentials for this SSID
+                if (password.empty()) {
+                    auto& ssid_manager = SsidManager::GetInstance();
+                    auto& ssid_list = ssid_manager.GetSsidList();
+                    for (int i = 0; i < (int)ssid_list.size(); i++) {
+                        if (ssid_list[i].ssid == ssid) {
+                            password = ssid_list[i].password;
+                            used_saved = true;
+                            ESP_LOGI(TAG, "Using saved credentials for SSID: %s", ssid.c_str());
+                            break;
+                        }
+                    }
+                    if (password.empty()) {
+                        return std::string("{\"error\":\"No saved password for " + ssid + ". Please provide the password.\"}");
+                    }
+                }
+
+                // Save and connect
+                {
+                    auto& ssid_manager = SsidManager::GetInstance();
+                    ssid_manager.AddSsid(ssid, password);
+                }
+                McpServer::GetInstance().SetDeferredReply(true);
+                auto* param = new WifiConnectTaskParam{reply_id, ssid, password};
+                xTaskCreatePinnedToCore(WifiConnectTask, "wifi_connect", 8192, param, 24, nullptr, 0);
+                if (used_saved) {
+                    return std::string("Using saved password to connect to " + ssid + "...");
+                }
+                return std::string("Connecting to " + ssid + "...");
+            });
+
+        mcp_server.AddTool("self.wifi.get_saved_networks",
+            "Get the list of WiFi networks saved on the device.\n"
+            "Returns: A list of saved WiFi network names (SSIDs).\n"
+            "Use this tool to check which networks the device remembers.",
+            PropertyList(), [](const PropertyList& properties) -> ReturnValue {
+                auto& ssid_manager = SsidManager::GetInstance();
+                auto& ssid_list = ssid_manager.GetSsidList();
+
+                if (ssid_list.empty()) {
+                    return std::string("{\"networks\":[]}");
+                }
+
+                cJSON* root = cJSON_CreateObject();
+                cJSON* networks = cJSON_CreateArray();
+                for (const auto& item : ssid_list) {
+                    cJSON* net = cJSON_CreateObject();
+                    cJSON_AddStringToObject(net, "ssid", item.ssid.c_str());
+                    cJSON_AddBoolToObject(net, "has_password", !item.password.empty());
+                    cJSON_AddItemToArray(networks, net);
+                }
+                cJSON_AddItemToObject(root, "networks", networks);
+
+                char* json_str = cJSON_PrintUnformatted(root);
+                std::string result(json_str);
+                cJSON_free(json_str);
+                cJSON_Delete(root);
+                return result;
+            });
+
+        mcp_server.AddTool("self.wifi.forget_network",
+            "Remove a saved WiFi network from the device memory.\n"
+            "Args:\n"
+            "  `ssid`: The name of the WiFi network to forget.\n"
+            "Use this tool when a saved network has the wrong password or the user no longer needs it.",
+            PropertyList({
+                Property("ssid", kPropertyTypeString)
+            }), [](const PropertyList& properties) -> ReturnValue {
+                std::string ssid = properties["ssid"].value<std::string>();
+                if (ssid.empty()) {
+                    return std::string("{\"error\":\"SSID is required\"}");
+                }
+
+                auto& ssid_manager = SsidManager::GetInstance();
+                auto& ssid_list = ssid_manager.GetSsidList();
+                bool found = false;
+                for (int i = 0; i < (int)ssid_list.size(); i++) {
+                    if (ssid_list[i].ssid == ssid) {
+                        ssid_manager.RemoveSsid(i);
+                        found = true;
+                        ESP_LOGI(TAG, "Forgot network: %s", ssid.c_str());
+                        break;
+                    }
+                }
+                if (!found) {
+                    return std::string("{\"error\":\"Network " + ssid + " not found in saved networks.\"}");
+                }
+                return std::string("{\"success\":true,\"message\":\"Network " + ssid + " has been removed from saved networks.\"}");
+            });
+
         mcp_server.AddTool("self.market.analyze",
             "Analyze the gold or Bitcoin market: download fresh candles from Yahoo Finance, "
             "compute technical indicators (RSI, MACD, EMA, ATR, ADX, Bollinger, volume), "
