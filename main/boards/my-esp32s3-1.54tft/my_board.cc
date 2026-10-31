@@ -198,12 +198,14 @@ public:
         delete p;
 
         auto display = self->GetDisplay();
-        auto& wifi_mgr = WifiManager::GetInstance();
 
         display->SetChatMessage("system", "Scanning WiFi...");
         ESP_LOGI(TAG, "Background scan task started on core %d, priority %d", xPortGetCoreID(), uxTaskPriorityGet(nullptr));
 
-        wifi_mgr.SetExternalScanMode(true);
+        // NOTE: the stock 78/esp-wifi-connect component (3.1.5) has no
+        // SetExternalScanMode(); if the station's reconnect timer fires a
+        // scan of its own, esp_wifi_scan_start() returns ESP_ERR_WIFI_STATE
+        // and the retry loop below simply tries again.
         esp_wifi_set_ps(WIFI_PS_NONE);
         vTaskDelay(pdMS_TO_TICKS(500));
 
@@ -236,7 +238,6 @@ public:
             if (attempt < 3) vTaskDelay(pdMS_TO_TICKS(1500));
         }
 
-        wifi_mgr.SetExternalScanMode(false);
         esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
 
         cJSON* root = cJSON_CreateArray();
