@@ -1,0 +1,13 @@
+## IDF Component Manager Manifest File
+dependencies:
+  # espressif/esp-box-3:
+  espressif/esp-box:
+    version: "*"
+    rules:
+    - if: "${IDF_TARGET} == esp32s3"
+
+  espressif2022/esp_emote_expression:
+    version: "*"
+    override_path: "../.."
+    matches:
+    - if: $CONFIG{EXAMPLE_EXPRESSIONS_ENABLE_EMOTE} == True

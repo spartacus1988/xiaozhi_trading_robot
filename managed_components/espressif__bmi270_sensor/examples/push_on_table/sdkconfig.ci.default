@@ -1,0 +1,2 @@
+# Keep an explicit default CI profile so idf-build-apps picks it up via
+# `sdkconfig.ci.*=` even when other sdkconfig.ci.* profiles exist.

@@ -1,0 +1,34 @@
+menu "ESP Emote Graphics Framework"
+
+    config GFX_FONT_FREETYPE_SUPPORT
+        bool "Enable FreeType font support"
+        default n
+        help
+            Enable support for FreeType fonts (TTF/OTF).
+            This requires the FreeType library to be enabled.
+
+            When enabled, you can use TrueType and OpenType fonts.
+            When disabled, only LVGL C format fonts are supported.
+
+    config GFX_EAF_JPEG_DECODE_SUPPORT
+        bool "Enable JPEG decoding support in EAF"
+        default y
+        help
+            Enable support for JPEG decoding in EAF (Emote Animation Format).
+            This requires the ESP JPEG decoder component to be enabled.
+
+            When enabled, EAF files can use JPEG encoding for image blocks.
+            When disabled, JPEG encoding will not be available, reducing code size.
+
+    config GFX_EAF_HEATSHRINK_SUPPORT
+        bool "Enable Heatshrink support in EAF"
+        default y
+        depends on HEATSHRINK_DYNAMIC_ALLOC || (HEATSHRINK_STATIC_WINDOW_BITS = 8 && HEATSHRINK_STATIC_LOOKAHEAD_BITS = 4)
+        help
+            Enable support for Heatshrink decoding in EAF (Emote Animation Format).
+
+            Note: Only supports 8-bit window and 4-bit lookahead if dynamic allocation is disabled.
+
+    comment "Heatshrink support is unavailable due to static bit mismatch"
+        depends on !HEATSHRINK_DYNAMIC_ALLOC && (HEATSHRINK_STATIC_WINDOW_BITS != 8 || HEATSHRINK_STATIC_LOOKAHEAD_BITS != 4)
+endmenu

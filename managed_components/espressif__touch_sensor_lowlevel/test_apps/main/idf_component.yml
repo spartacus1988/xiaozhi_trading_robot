@@ -1,0 +1,4 @@
+dependencies:
+  idf: ">=4.4"
+  touch_sensor_lowlevel:
+    override_path: "../../../touch_sensor_lowlevel"

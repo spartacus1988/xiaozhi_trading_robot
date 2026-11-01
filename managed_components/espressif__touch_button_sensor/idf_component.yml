@@ -1,0 +1,26 @@
+dependencies:
+  cmake_utilities: 0.*
+  idf: '>=4.4,<6.0'
+  touch_sensor_fsm:
+    version: '>=0.8.1~1,<0.8.2'
+  touch_sensor_lowlevel:
+    public: true
+    version: '>=0.9.1~1,<0.10.0'
+description: Touch button sensor with enhanced FSM for better anti-interference performance
+  (Experimental)
+files:
+  exclude:
+  - '**/build*/**/*'
+issues: https://github.com/espressif/esp-iot-solution/issues
+repository: git://github.com/espressif/esp-iot-solution.git
+repository_info:
+  commit_sha: 4bb89480f7b7c7ed84efa2192a620053ce5b6edc
+  path: components/touch/touch_button_sensor
+targets:
+- esp32
+- esp32s2
+- esp32s3
+- esp32p4
+- linux
+url: https://github.com/espressif/esp-iot-solution/tree/master/components/touch/
+version: 0.2.2~1

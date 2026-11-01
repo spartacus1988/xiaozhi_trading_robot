@@ -1,0 +1,54 @@
+menu "Touch sensor lowlevel"
+
+    config TOUCH_SENSOR_LOWLEVEL_SIMULATOR
+        bool "Touch sensor lowlevel simulator"
+        depends on IDF_TARGET_LINUX
+        default y
+        help
+        Enable touch sensor lowlevel driver simulator.
+
+    config ENABLE_TOUCH_SUPPRESS_DEPRECATE_WARN
+        bool
+        default y
+        select TOUCH_SUPPRESS_DEPRECATE_WARN
+
+    config TOUCH_SENSOR_DEBUG_GPIO_TRIGGER
+        bool "Touch sensor debug GPIO trigger"
+        depends on !TOUCH_SENSOR_LOWLEVEL_SIMULATOR
+        default n
+        help
+        Enable touch sensor debug GPIO trigger. high level will trigger when touch sensor data is ready.
+
+    config TOUCH_SENSOR_DEBUG_GPIO_TRIGGER_PIN
+        int "GPIO trigger pin"
+        depends on TOUCH_SENSOR_DEBUG_GPIO_TRIGGER
+        default 21 if !CONFIG_IDF_TARGET_ESP32
+        default 17 if CONFIG_IDF_TARGET_ESP32
+        help
+        Touch sensor debug GPIO trigger pin.
+
+    config TOUCH_SENSOR_LOWLEVEL_SIMULATOR_REALTIME
+        bool "Touch sensor lowlevel simulator realtime"
+        depends on TOUCH_SENSOR_LOWLEVEL_SIMULATOR
+        default n
+        help
+        Enable touch sensor low level driver simulator realtime mode.
+        The new data callback will be called with the real time data.
+
+    choice TOUCH_SENSOR_LOWLEVEL_SIMULATOR_TARGET
+        prompt "Simulator target"
+        depends on TOUCH_SENSOR_LOWLEVEL_SIMULATOR
+        default TOUCH_SENSOR_LOWLEVEL_SIMULATOR_TARGET_ESP32S2S3
+
+        config TOUCH_SENSOR_LOWLEVEL_SIMULATOR_TARGET_ESP32S2S3
+            bool "ESP32-S2/S3"
+            help
+            Enable touch sensor lowlevel driver simulator for ESP32-S2/S3.
+
+        config TOUCH_SENSOR_LOWLEVEL_SIMULATOR_TARGET_ESP32P4
+            bool "ESP32-P4"
+            help
+            Enable touch sensor lowlevel driver simulator for ESP32-P4.
+    endchoice
+
+endmenu

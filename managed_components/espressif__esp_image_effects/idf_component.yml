@@ -1,0 +1,17 @@
+dependencies:
+  idf:
+    version: '>=5.0'
+description: Espressif image effects
+issues: https://github.com/espressif/esp-adf/issues
+repository: git://github.com/espressif/esp-adf-libs.git
+repository_info:
+  commit_sha: e866d4542005815d29d183d33e17b07c447840a1
+  path: esp_image_effects
+tags:
+- multimedia
+- scale
+- rotation
+- crop
+- color_conversion
+url: https://github.com/espressif/esp-adf-libs/tree/master/esp_image_effects
+version: 1.2.0
