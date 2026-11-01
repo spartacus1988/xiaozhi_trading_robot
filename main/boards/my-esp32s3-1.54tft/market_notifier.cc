@@ -154,6 +154,9 @@ bool FetchOhlcv(const AssetConfig& cfg,
     }
 
     auto http = network->CreateHttp(0);
+    // NOTE: with this client the timeout is a per-read wait, not a whole-body
+    // budget, so 30 s of silence between two chunks is already generous.
+    http->SetTimeout(30000);
     http->SetHeader("User-Agent", "Mozilla/5.0");
 
     if (!http->Open("GET", url)) {
@@ -173,8 +176,33 @@ bool FetchOhlcv(const AssetConfig& cfg,
         return false;
     }
 
-    std::string body = http->ReadAll();
+    // Read the body in chunks instead of ReadAll().
+    //
+    // Http::ReadAll() waits for eof_ without ever draining body_chunks_, while
+    // the receive path blocks itself once 8 kB are buffered there
+    // (MAX_BODY_CHUNKS_SIZE in http_client.cc) and is only released by a Read()
+    // or a Close(). Any response larger than 8 kB therefore deadlocks and
+    // ReadAll() times out and returns an empty string, which then looks like a
+    // JSON parse error. Both Yahoo payloads are way above that limit (BTC
+    // ~35 kB, gold ~80 kB), so streaming them is mandatory.
+    std::string body;
+    char buffer[1536];
+    while (true) {
+        int bytes_read = http->Read(buffer, sizeof(buffer));
+        if (bytes_read < 0) {
+            http->Close();
+            error = "connection to Yahoo Finance was reset while downloading";
+            return false;
+        }
+        if (bytes_read == 0) {
+            break;  // end of body
+        }
+        body.append(buffer, static_cast<size_t>(bytes_read));
+    }
     http->Close();
+
+    ESP_LOGI(TAG, "Downloaded %u bytes from Yahoo for %s",
+             static_cast<unsigned>(body.size()), cfg.ticker);
 
     cJSON* root = cJSON_Parse(body.c_str());
     if (root == nullptr) {
