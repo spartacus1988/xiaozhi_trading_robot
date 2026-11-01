@@ -7,9 +7,10 @@
  *   1. bot state      (was bot_state.json -> now NVS)
  *   2. data loading   (Yahoo Finance chart API over HTTPS)
  *   3. indicators     (EMA, RSI, MACD, ATR, ADX, Bollinger)
- *   4. signal         (play_signal -> Application::Alert)
+ *   4. signal         (play_signal -> Application::Alert, trades only)
  *   5. bot logic      (stop-loss / take-profit / time exit / signal exit)
  *   6. analysis       (score + verdict)
+ *   7. monitor loop   (main() -> FreeRTOS task + self.market.monitor tool)
  */
 
 #include "market_notifier.h"
@@ -19,6 +20,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -35,6 +37,11 @@
 #define TAG "MarketNotifier"
 
 namespace {
+
+// A cycle called from self.market.analyze and one called by the monitor task
+// can overlap in time; the NVS bot state must never be read-modify-written by
+// two cycles at once, so every cycle takes this lock.
+std::mutex g_cycle_mutex;
 
 // ---------- Settings (from the "НАСТРОЙКИ" block of main.py) ----------
 struct AssetConfig {
@@ -467,19 +474,51 @@ BollingerValue Bollinger(const std::vector<double>& values, int period, double m
 
 // ---------- 4. Signal ----------
 
-// The Python script beeps with a rising tone for bulls and a falling tone for
-// bears. The board only has a speaker, so the same idea is expressed with two
-// different system sounds.
-void PlaySignal(int score) {
-    if (score == 0) return;  // SOUND_FOR_NEUTRAL = False in the original
+// The Python script plays a beep on *every* iteration, scaled by |score|
+// (play_signal). That was fine for a console script, but the device now runs
+// the same loop unattended every minute, so a beep per iteration would be
+// constant noise. Per the requested behaviour the board stays silent unless
+// the trading bot actually opens or closes a position: BUY, STRONG_BUY,
+// STOP_LOSS, TAKE_PROFIT, SELL and TIME_EXIT announce themselves, while HOLD
+// and WAIT announce nothing at all.
+//
+// The message is shown on the display and written to the log. Speech is not
+// available here: the device has no local TTS, everything spoken by the
+// assistant comes from the server over MQTT.
+void NotifyTrade(const AssetConfig* cfg, const char* action, int score,
+                 double price, double pnl_pct, double pnl_usd, double hold_min,
+                 const BotState& state) {
+    const bool is_entry = strcmp(action, "BUY") == 0 || strcmp(action, "STRONG_BUY") == 0;
+    const bool is_exit  = strcmp(action, "STOP_LOSS") == 0 || strcmp(action, "TAKE_PROFIT") == 0 ||
+                          strcmp(action, "SELL") == 0 || strcmp(action, "TIME_EXIT") == 0;
+    if (!is_entry && !is_exit) {
+        return;  // HOLD or WAIT: no sound, no display update
+    }
+
+    char message[160];
+    if (is_entry) {
+        snprintf(message, sizeof(message),
+                 "%s: position opened, %.8f at $%.*f (score %+d)",
+                 cfg->name, state.asset, cfg->decimals, price, score);
+    } else if (strcmp(action, "STOP_LOSS") == 0) {
+        snprintf(message, sizeof(message),
+                 "Stop loss: %.2f%%, result %+.2f USD", pnl_pct, pnl_usd);
+    } else if (strcmp(action, "TAKE_PROFIT") == 0) {
+        snprintf(message, sizeof(message),
+                 "Take profit: +%.2f%%, result %+.2f USD", pnl_pct, pnl_usd);
+    } else if (strcmp(action, "SELL") == 0) {
+        snprintf(message, sizeof(message),
+                 "Sold on signal (score %+d), result %+.2f USD", score, pnl_usd);
+    } else {
+        snprintf(message, sizeof(message),
+                 "Exit by time after %.0f min, result %+.2f USD", hold_min, pnl_usd);
+    }
 
     auto& app = Application::GetInstance();
-    if (score > 0) {
-        app.Alert("Market", score >= 4 ? "Strong buy signal" : "Buy signal",
-                  "radar", Lang::Sounds::OGG_POPUP);
+    if (is_entry) {
+        app.Alert("Market", message, "happy", Lang::Sounds::OGG_SUCCESS);
     } else {
-        app.Alert("Market", score <= -4 ? "Strong sell signal" : "Sell signal",
-                  "radar", Lang::Sounds::OGG_EXCLAMATION);
+        app.Alert("Market", message, "angry", Lang::Sounds::OGG_EXCLAMATION);
     }
 }
 
@@ -489,28 +528,35 @@ void PlaySignal(int score) {
 // wall-clock time after the boot-time OTA check syncs it (see ota.cc,
 // settimeofday), so the same source is used here; entry times stored in NVS
 // remain valid across reboots.
-const char* BotAction(double price, int score, BotState& state) {
+// pnl_pct, pnl_usd and hold_min are reported through out parameters so that
+// NotifyTrade() can announce them after the state has already been closed.
+const char* BotAction(double price, int score, BotState& state,
+                      double& pnl_pct, double& pnl_usd, double& hold_time_min) {
     const double now = (double)time(nullptr);
     const char* action = "WAIT";
 
+    pnl_pct = 0.0;
+    pnl_usd = 0.0;
+    hold_time_min = 0.0;
+
     if (state.asset > 0.0 && state.entry > 0.0) {
         // We are in a position.
-        double pnl_pct = ((price - state.entry) / state.entry) * 100.0;
-        double hold_time_min = (now - state.entry_time) / 60.0;
-        double profit_usd = (price - state.entry) * state.asset;
+        pnl_pct = ((price - state.entry) / state.entry) * 100.0;
+        hold_time_min = (now - state.entry_time) / 60.0;
+        pnl_usd = (price - state.entry) * state.asset;
 
         if (pnl_pct <= -kStopLossPct) {
             action = "STOP_LOSS";
-            ESP_LOGW(TAG, "STOP LOSS! Drawdown %.2f%% (PnL: %+.2f USD)", pnl_pct, profit_usd);
+            ESP_LOGW(TAG, "STOP LOSS! Drawdown %.2f%% (PnL: %+.2f USD)", pnl_pct, pnl_usd);
         } else if (pnl_pct >= kTakeProfitPct) {
             action = "TAKE_PROFIT";
-            ESP_LOGW(TAG, "TAKE PROFIT! Profit %.2f%% (PnL: %+.2f USD)", pnl_pct, profit_usd);
+            ESP_LOGW(TAG, "TAKE PROFIT! Profit %.2f%% (PnL: %+.2f USD)", pnl_pct, pnl_usd);
         } else if (score <= -2) {
             action = "SELL";
-            ESP_LOGW(TAG, "SELL ON SIGNAL (Score: %d, PnL: %+.2f USD)", score, profit_usd);
+            ESP_LOGW(TAG, "SELL ON SIGNAL (Score: %d, PnL: %+.2f USD)", score, pnl_usd);
         } else if (hold_time_min > kMaxHoldTimeMin && pnl_pct < 1.0) {
             action = "TIME_EXIT";
-            ESP_LOGW(TAG, "TIME EXIT (held %.0f min, PnL: %+.2f USD)", hold_time_min, profit_usd);
+            ESP_LOGW(TAG, "TIME EXIT (held %.0f min, PnL: %+.2f USD)", hold_time_min, pnl_usd);
         } else {
             action = "HOLD";
         }
@@ -613,25 +659,23 @@ std::string ErrorJson(const std::string& message) {
 
 }  // namespace
 
-std::string MarketNotifier::Analyze(const std::string& asset) {
-    std::string key = asset;
-    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
-        return (char)tolower(c);
-    });
+namespace {
 
-    const AssetConfig* cfg = nullptr;
-    for (size_t i = 0; i < kAssetCount; i++) {
-        if (key == kAssets[i].key) cfg = &kAssets[i];
-    }
-    if (cfg == nullptr) {
-        return ErrorJson("unknown asset '" + asset + "', use 'gold' or 'btc'");
-    }
+// One full iteration of the Python loop: download candles, score them, let the
+// trading bot act on that score, persist the new state, announce a real trade
+// and build the report. Both self.market.analyze and the monitor task run this
+// same function, so the two paths can never drift apart.
+bool RunCycle(const AssetConfig* cfg, std::string& report, std::string& error) {
+    // The tool and the monitor task can overlap in time; the NVS state is a
+    // read-modify-write and must not be interleaved.
+    std::lock_guard<std::mutex> cycle_lock(g_cycle_mutex);
 
     std::vector<double> highs, lows, closes, volumes;
     std::string fetch_error;
     if (!FetchOhlcv(*cfg, highs, lows, closes, volumes, fetch_error)) {
         ESP_LOGE(TAG, "Fetch failed: %s", fetch_error.c_str());
-        return ErrorJson(fetch_error);
+        error = fetch_error;
+        return false;
     }
 
     // The Python script quits the cycle when there are not enough candles for
@@ -639,7 +683,8 @@ std::string MarketNotifier::Analyze(const std::string& asset) {
     if (closes.size() < (size_t)(kMacdSlow + kMacdSignal)) {
         ESP_LOGW(TAG, "Only %d candles for %s, not enough for the analysis",
                  (int)closes.size(), cfg->ticker);
-        return ErrorJson("not enough candles for ticker " + std::string(cfg->ticker));
+        error = "not enough candles for ticker " + std::string(cfg->ticker);
+        return false;
     }
 
     BotState state = LoadState(*cfg);
@@ -703,7 +748,8 @@ std::string MarketNotifier::Analyze(const std::string& asset) {
     const char* verdict = Verdict(score);
 
     // ---------- Run the trading bot and persist the new state ----------
-    const char* action = BotAction(price, score, state);
+    double pnl_pct = 0.0, pnl_usd = 0.0, hold_time_min = 0.0;
+    const char* action = BotAction(price, score, state, pnl_pct, pnl_usd, hold_time_min);
     SaveState(*cfg, state);
 
     // ---------- Build the MCP payload ----------
@@ -816,6 +862,177 @@ std::string MarketNotifier::Analyze(const std::string& asset) {
     ESP_LOGI(TAG, "%s (%s) price %.*f, score %+d, action %s",
              cfg->name, cfg->ticker, dec, price, score, action);
 
-    PlaySignal(score);
+    NotifyTrade(cfg, action, score, price, pnl_pct, pnl_usd, hold_time_min, state);
+
+    report = std::move(result);
+    return true;
+}
+
+}  // namespace
+
+// ---------- 7. Monitor loop (the Python main()) ----------
+
+bool MarketNotifier::ResolveAsset(const std::string& asset,
+                                  size_t& index, std::string& error) const {
+    std::string key = asset;
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return (char)tolower(c);
+    });
+
+    for (size_t i = 0; i < kAssetCount; i++) {
+        if (key == kAssets[i].key) {
+            index = i;
+            return true;
+        }
+    }
+
+    error = "unknown asset '" + asset + "', use 'gold' or 'btc'";
+    return false;
+}
+
+std::string MarketNotifier::Analyze(const std::string& asset) {
+    size_t index = 0;
+    std::string error;
+    if (!ResolveAsset(asset, index, error)) {
+        return ErrorJson(error);
+    }
+
+    std::string report, cycle_error;
+    if (!RunCycle(kAssets[index], report, cycle_error)) {
+        return ErrorJson(cycle_error);
+    }
+    return report;
+}
+
+// Serialises the monitor state into the tool payload.
+static std::string MonitorJson(bool running, const AssetConfig* cfg,
+                               int interval_sec, const std::string& error,
+                               const std::string& first_report) {
+    cJSON* root = nullptr;
+
+    // Reuse the first cycle's report as the base so the assistant can read the
+    // analysis aloud right after starting the monitor.
+    if (!first_report.empty()) {
+        root = cJSON_Parse(first_report.c_str());
+    }
+    if (root == nullptr) {
+        root = cJSON_CreateObject();
+    }
+
+    cJSON* monitor = cJSON_CreateObject();
+    cJSON_AddBoolToObject(monitor, "running", running);
+    if (cfg != nullptr) {
+        cJSON_AddStringToObject(monitor, "asset", cfg->key);
+        cJSON_AddNumberToObject(monitor, "interval_sec", interval_sec);
+    }
+    cJSON_AddItemToObject(root, "monitor", monitor);
+
+    if (!error.empty()) {
+        cJSON_AddStringToObject(root, "error", error.c_str());
+    }
+
+    char* json_str = cJSON_PrintUnformatted(root);
+    std::string result(json_str);
+    cJSON_free(json_str);
+    cJSON_Delete(root);
     return result;
+}
+
+std::string MarketNotifier::MonitorStatus() {
+    const AssetConfig* cfg = monitor_running_ ? &kAssets[monitor_asset_index_] : nullptr;
+    return MonitorJson(monitor_running_, cfg, monitor_interval_sec_, "", "");
+}
+
+std::string MarketNotifier::StartMonitor(const std::string& asset, int interval_sec) {
+    size_t index = 0;
+    std::string error;
+    if (!ResolveAsset(asset, index, error)) {
+        return ErrorJson(error);
+    }
+
+    // Keep the request sane; the original script used a fixed 60 s.
+    if (interval_sec < 10) interval_sec = 10;
+    if (interval_sec > 3600) interval_sec = 3600;
+
+    // Restart cleanly if it was already running for another asset.
+    StopMonitor();
+
+    // The first cycle runs synchronously so the tool call returns a full
+    // report, exactly like the Python loop which starts with analyze().
+    std::string first_report, cycle_error;
+    RunCycle(kAssets[index], first_report, cycle_error);
+    if (!cycle_error.empty()) {
+        ESP_LOGW(TAG, "Monitor first cycle failed: %s", cycle_error.c_str());
+    }
+
+    monitor_asset_index_ = index;
+    monitor_interval_sec_ = interval_sec;
+    monitor_task_alive_ = true;
+    monitor_running_ = true;
+    if (xTaskCreate(MonitorTaskEntry, "mkt_monitor", 8192, this, 3,
+                    &monitor_task_handle_) != pdPASS) {
+        monitor_running_ = false;
+        monitor_task_alive_ = false;
+        monitor_task_handle_ = nullptr;
+        return ErrorJson("failed to create the monitor task");
+    }
+
+    ESP_LOGI(TAG, "Monitor started for %s every %d s",
+             kAssets[index].key, interval_sec);
+    return MonitorJson(true, &kAssets[index], interval_sec, cycle_error, first_report);
+}
+
+std::string MarketNotifier::StopMonitor() {
+    if (!monitor_running_) {
+        return MonitorStatus();
+    }
+
+    monitor_running_ = false;
+    // The task sleeps in one second slices, so it notices the flag quickly.
+    for (int i = 0; i < 15 && monitor_task_alive_; i++) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    if (monitor_task_alive_) {
+        ESP_LOGE(TAG, "Monitor task did not stop in time, killing it");
+        if (monitor_task_handle_ != nullptr) {
+            vTaskDelete(monitor_task_handle_);
+        }
+        monitor_task_alive_ = false;
+    }
+    monitor_task_handle_ = nullptr;
+
+    ESP_LOGI(TAG, "Monitor stopped");
+    return MonitorStatus();
+}
+
+void MarketNotifier::MonitorTaskEntry(void* arg) {
+    auto* self = static_cast<MarketNotifier*>(arg);
+    self->MonitorTaskLoop();
+    self->monitor_task_alive_ = false;
+    vTaskDelete(nullptr);
+}
+
+void MarketNotifier::MonitorTaskLoop() {
+    const AssetConfig* cfg = &kAssets[monitor_asset_index_];
+
+    while (monitor_running_) {
+        // Sleep first: StartMonitor() already did the first cycle, and the
+        // period matches the Python time.sleep(INTERVAL).
+        for (int slept = 0; monitor_running_ && slept < monitor_interval_sec_; slept++) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+        if (!monitor_running_) {
+            break;
+        }
+
+        std::string report, error;
+        if (!RunCycle(cfg, report, error)) {
+            // Mirrors the Python loop, which logs the error and keeps going.
+            ESP_LOGE(TAG, "Monitor cycle for %s failed: %s", cfg->key, error.c_str());
+        }
+    }
+}
+
+MarketNotifier::~MarketNotifier() {
+    StopMonitor();
 }

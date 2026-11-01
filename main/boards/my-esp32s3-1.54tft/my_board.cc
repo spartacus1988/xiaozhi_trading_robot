@@ -60,6 +60,10 @@ private:
     static std::vector<SnifferPacket> sniffer_log_;
     static int sniffer_duration_seconds_;
 
+    // Owns the trading bot state and the background monitor task, so that the
+    // self.market.analyze and self.market.monitor tools share one instance.
+    MarketNotifier market_notifier_;
+
 public:
     struct DnsQuery {
         uint32_t timestamp_sec;
@@ -1191,8 +1195,50 @@ public:
             PropertyList({
                 Property("asset", kPropertyTypeString, std::string("btc"))
             }),
-            [](const PropertyList& properties) -> ReturnValue {
-                return MarketNotifier::Analyze(properties["asset"].value<std::string>());
+            [this](const PropertyList& properties) -> ReturnValue {
+                return market_notifier_.Analyze(properties["asset"].value<std::string>());
+            });
+
+        // The Python script polled Yahoo every INTERVAL seconds from main().
+        // The device cannot call MCP tools by itself, so the same loop lives in
+        // a FreeRTOS task started and stopped through this tool.
+        mcp_server.AddTool("self.market.monitor",
+            "Start, stop or inspect the background market monitor: a task that keeps "
+            "analyzing the market on its own every `interval_sec` seconds, without "
+            "waiting for anyone to ask.\n"
+            "While it runs the device plays a sound and shows a message on its display "
+            "only when the trading bot actually opens or closes a position (BUY, "
+            "STRONG_BUY, STOP_LOSS, TAKE_PROFIT, SELL, TIME_EXIT). HOLD and WAIT are "
+            "silent, so a running monitor makes no noise in a quiet market.\n"
+            "The monitor is held in RAM and is lost on reboot; the bot's money and "
+            "position state are not, they survive in flash.\n"
+            "Args:\n"
+            "  `action`: `start` (default), `stop` or `status`.\n"
+            "  `asset`: `gold` or `btc`, used by `start`. Defaults to `btc`.\n"
+            "  `interval_sec`: polling period for `start`, 10-3600 seconds, "
+            "defaults to 60.\n"
+            "Returns: for `start` the first full analysis report plus a `monitor` "
+            "object; otherwise a `monitor` object with `running`, `asset` and "
+            "`interval_sec`.",
+            PropertyList({
+                Property("action", kPropertyTypeString, std::string("start")),
+                Property("asset", kPropertyTypeString, std::string("btc")),
+                Property("interval_sec", kPropertyTypeInteger, 60, 10, 3600)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string action = properties["action"].value<std::string>();
+                if (action == "stop") {
+                    return market_notifier_.StopMonitor();
+                }
+                if (action == "status") {
+                    return market_notifier_.MonitorStatus();
+                }
+                if (action != "start") {
+                    return std::string("{\"error\":\"action must be start, stop or status\"}");
+                }
+                return market_notifier_.StartMonitor(
+                    properties["asset"].value<std::string>(),
+                    properties["interval_sec"].value<int>());
             });
     }
 
