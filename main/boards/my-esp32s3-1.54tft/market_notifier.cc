@@ -41,6 +41,7 @@
 // it. Kept as a plain extern because the DoH cache lives with the board's DNS
 // hook, not with the market code.
 extern void DohNoteConnectFailure(const char* host);
+extern bool DohHostIsUsable(const char* host);
 
 namespace {
 
@@ -180,6 +181,15 @@ bool FetchOhlcv(const AssetConfig& cfg,
 
     for (size_t attempt = 0; attempt < kYahooHostCount; ++attempt) {
         const char* host = kYahooHosts[attempt];
+
+        // A host whose whole address pool is already known not to answer TLS
+        // would only burn the connect timeout; the fallback host gets a chance
+        // instead and the pool is refreshed in the background anyway.
+        if (!DohHostIsUsable(host)) {
+            ESP_LOGW(TAG, "Skipping %s: every address it resolves to is marked bad", host);
+            continue;
+        }
+
         const std::string url = std::string("https://") + host + "/v8/finance/chart/" +
                                 cfg.ticker + "?interval=" + cfg.interval + "&range=" + cfg.range;
 

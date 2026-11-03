@@ -1537,9 +1537,10 @@ const char* kDohHosts[] = {
     "query2.finance.yahoo.com",
 };
 
-// A dead address is skipped for half an hour, which is long enough for the
-// pool to move on and short enough to recover if it was a transient failure.
-constexpr uint32_t kBadAddressSeconds = 30 * 60;
+// A dead address is skipped long enough to cover several fetch cycles and the
+// ten minute refresh of the pool; a refresh that brings new addresses makes
+// the host usable again without waiting for the mark to expire.
+constexpr uint32_t kBadAddressSeconds = 15 * 60;
 
 uint32_t NowSec() {
     return static_cast<uint32_t>(esp_timer_get_time() / 1000000);
@@ -1765,6 +1766,29 @@ void DohNoteConnectFailure(const char* host) {
     ESP_LOGW("DNS_HOOK", "%s: %s refused a TLS handshake, skipping it for %u min",
              host, KeyToString(served->second).c_str(),
              static_cast<unsigned>(kBadAddressSeconds / 60));
+}
+
+// True unless the DoH cache holds this host and every address in it is
+// currently marked bad. The market fetch checks this before connecting, so a
+// host whose whole pool is known to be dead is skipped instead of costing the
+// full ten second connect timeout on every cycle.
+bool DohHostIsUsable(const char* host) {
+    if (host == nullptr) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(g_doh_mutex);
+    auto it = g_doh_cache.find(host);
+    if (it == g_doh_cache.end() || it->second.addrs.empty()) {
+        return true;  // no DoH data for this name, normal DNS decides
+    }
+    uint32_t now = NowSec();
+    for (const DohAddr& address : it->second.addrs) {
+        auto bad = g_bad_until.find(address.key);
+        if (bad == g_bad_until.end() || now >= bad->second) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void StartDohRefreshTask() {
