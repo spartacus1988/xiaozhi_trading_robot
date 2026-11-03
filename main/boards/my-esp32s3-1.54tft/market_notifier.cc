@@ -145,71 +145,98 @@ void SaveState(const AssetConfig& cfg, const BotState& state) {
 
 // ---------- 2. Data loading ----------
 
+// Yahoo serves the identical chart API from two hostnames that resolve to
+// different edge IPs. On some networks only one of them answers: DNS is fine
+// for both, but the TCP handshake to the other one is silently dropped and
+// esp-tls gives up after its connect timeout. Since the whole fetch dies on
+// the very first Open(), a failed open is retried on the second host instead
+// of being reported as an outage right away.
+const char* kYahooHosts[] = {
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",
+};
+constexpr size_t kYahooHostCount = sizeof(kYahooHosts) / sizeof(kYahooHosts[0]);
+
 bool FetchOhlcv(const AssetConfig& cfg,
                 std::vector<double>& highs,
                 std::vector<double>& lows,
                 std::vector<double>& closes,
                 std::vector<double>& volumes,
                 std::string& error) {
-    const std::string url = std::string("https://query1.finance.yahoo.com/v8/finance/chart/") +
-                            cfg.ticker + "?interval=" + cfg.interval + "&range=" + cfg.range;
-
     auto network = Board::GetInstance().GetNetwork();
     if (network == nullptr) {
         error = "network is not available";
         return false;
     }
 
-    auto http = network->CreateHttp(0);
-    // NOTE: with this client the timeout is a per-read wait, not a whole-body
-    // budget, so 30 s of silence between two chunks is already generous.
-    http->SetTimeout(30000);
-    http->SetHeader("User-Agent", "Mozilla/5.0");
+    std::string body;
+    bool opened = false;
 
-    if (!http->Open("GET", url)) {
+    for (size_t attempt = 0; attempt < kYahooHostCount; ++attempt) {
+        const char* host = kYahooHosts[attempt];
+        const std::string url = std::string("https://") + host + "/v8/finance/chart/" +
+                                cfg.ticker + "?interval=" + cfg.interval + "&range=" + cfg.range;
+
+        auto http = network->CreateHttp(0);
+        // NOTE: with this client the timeout is a per-read wait, not a whole-body
+        // budget, so 30 s of silence between two chunks is already generous.
+        http->SetTimeout(30000);
+        http->SetHeader("User-Agent", "Mozilla/5.0");
+
+        if (!http->Open("GET", url)) {
+            ESP_LOGW(TAG, "Open failed on %s, %s", host,
+                     attempt + 1 < kYahooHostCount ? "trying the fallback host"
+                                                   : "no hosts left");
+            continue;
+        }
+        opened = true;
+
+        int status_code = http->GetStatusCode();
+        if (status_code == 429) {
+            http->Close();
+            error = "Yahoo Finance rate limit (HTTP 429), try again later";
+            return false;
+        }
+        if (status_code != 200) {
+            http->Close();
+            error = "Yahoo Finance replied with HTTP " + std::to_string(status_code);
+            return false;
+        }
+
+        // Read the body in chunks instead of ReadAll().
+        //
+        // Http::ReadAll() waits for eof_ without ever draining body_chunks_,
+        // while the receive path blocks itself once 8 kB are buffered there
+        // (MAX_BODY_CHUNKS_SIZE in http_client.cc) and is only released by a
+        // Read() or a Close(). Any response larger than 8 kB therefore
+        // deadlocks and ReadAll() times out and returns an empty string, which
+        // then looks like a JSON parse error. Both Yahoo payloads are way
+        // above that limit (BTC ~35 kB, gold ~80 kB), so streaming them is
+        // mandatory.
+        char buffer[1536];
+        while (true) {
+            int bytes_read = http->Read(buffer, sizeof(buffer));
+            if (bytes_read < 0) {
+                http->Close();
+                error = "connection to Yahoo Finance was reset while downloading";
+                return false;
+            }
+            if (bytes_read == 0) {
+                break;  // end of body
+            }
+            body.append(buffer, static_cast<size_t>(bytes_read));
+        }
+        http->Close();
+
+        ESP_LOGI(TAG, "Downloaded %u bytes from %s for %s",
+                 static_cast<unsigned>(body.size()), host, cfg.ticker);
+        break;  // complete body received, no need for the fallback host
+    }
+
+    if (!opened) {
         error = "failed to open a connection to Yahoo Finance";
         return false;
     }
-
-    int status_code = http->GetStatusCode();
-    if (status_code == 429) {
-        http->Close();
-        error = "Yahoo Finance rate limit (HTTP 429), try again later";
-        return false;
-    }
-    if (status_code != 200) {
-        http->Close();
-        error = "Yahoo Finance replied with HTTP " + std::to_string(status_code);
-        return false;
-    }
-
-    // Read the body in chunks instead of ReadAll().
-    //
-    // Http::ReadAll() waits for eof_ without ever draining body_chunks_, while
-    // the receive path blocks itself once 8 kB are buffered there
-    // (MAX_BODY_CHUNKS_SIZE in http_client.cc) and is only released by a Read()
-    // or a Close(). Any response larger than 8 kB therefore deadlocks and
-    // ReadAll() times out and returns an empty string, which then looks like a
-    // JSON parse error. Both Yahoo payloads are way above that limit (BTC
-    // ~35 kB, gold ~80 kB), so streaming them is mandatory.
-    std::string body;
-    char buffer[1536];
-    while (true) {
-        int bytes_read = http->Read(buffer, sizeof(buffer));
-        if (bytes_read < 0) {
-            http->Close();
-            error = "connection to Yahoo Finance was reset while downloading";
-            return false;
-        }
-        if (bytes_read == 0) {
-            break;  // end of body
-        }
-        body.append(buffer, static_cast<size_t>(bytes_read));
-    }
-    http->Close();
-
-    ESP_LOGI(TAG, "Downloaded %u bytes from Yahoo for %s",
-             static_cast<unsigned>(body.size()), cfg.ticker);
 
     cJSON* root = cJSON_Parse(body.c_str());
     if (root == nullptr) {
@@ -898,7 +925,7 @@ std::string MarketNotifier::Analyze(const std::string& asset) {
     }
 
     std::string report, cycle_error;
-    if (!RunCycle(kAssets[index], report, cycle_error)) {
+    if (!RunCycle(&kAssets[index], report, cycle_error)) {
         return ErrorJson(cycle_error);
     }
     return report;
@@ -960,7 +987,7 @@ std::string MarketNotifier::StartMonitor(const std::string& asset, int interval_
     // The first cycle runs synchronously so the tool call returns a full
     // report, exactly like the Python loop which starts with analyze().
     std::string first_report, cycle_error;
-    RunCycle(kAssets[index], first_report, cycle_error);
+    RunCycle(&kAssets[index], first_report, cycle_error);
     if (!cycle_error.empty()) {
         ESP_LOGW(TAG, "Monitor first cycle failed: %s", cycle_error.c_str());
     }

@@ -20,6 +20,18 @@
 
 #define TAG "MCP"
 
+// The serial log runs at INFO level, so without these two lines the raw
+// JSONRPC traffic is invisible and a broken tool call cannot be told apart
+// from a broken tool. Replies can be several kB (tools/list), so they are
+// truncated; incoming messages are small and are logged in full.
+static std::string TruncateForLog(const std::string& payload, size_t max_len = 700) {
+    if (payload.size() <= max_len) {
+        return payload;
+    }
+    return payload.substr(0, max_len) + "...<truncated, " +
+           std::to_string(payload.size()) + " bytes total>";
+}
+
 McpServer::McpServer() {
 }
 
@@ -348,6 +360,15 @@ void McpServer::ParseCapabilities(const cJSON* capabilities) {
 }
 
 void McpServer::ParseMessage(const cJSON* json) {
+    // The application hands over an already parsed payload, so the raw JSONRPC
+    // has to be re-serialised to be visible in the log. This is the single
+    // entry point for everything the server sends us.
+    char* raw = cJSON_PrintUnformatted(json);
+    if (raw != nullptr) {
+        ESP_LOGI(TAG, "MCP <<< %s", TruncateForLog(raw).c_str());
+        cJSON_free(raw);
+    }
+
     // Check JSONRPC version
     auto version = cJSON_GetObjectItem(json, "jsonrpc");
     if (version == nullptr || !cJSON_IsString(version) || strcmp(version->valuestring, "2.0") != 0) {
@@ -437,6 +458,7 @@ void McpServer::ReplyResult(int id, const std::string& result) {
     payload += std::to_string(id) + ",\"result\":";
     payload += result;
     payload += "}";
+    ESP_LOGI(TAG, "MCP >>> %s", TruncateForLog(payload).c_str());
     Application::GetInstance().SendMcpMessage(payload);
 }
 
@@ -446,6 +468,7 @@ void McpServer::ReplyError(int id, const std::string& message) {
     payload += ",\"error\":{\"message\":\"";
     payload += message;
     payload += "\"}}";
+    ESP_LOGE(TAG, "MCP >>> %s", TruncateForLog(payload).c_str());
     Application::GetInstance().SendMcpMessage(payload);
 }
 

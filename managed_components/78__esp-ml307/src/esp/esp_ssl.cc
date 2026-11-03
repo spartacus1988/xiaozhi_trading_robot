@@ -2,7 +2,12 @@
 #include <esp_log.h>
 #include <esp_crt_bundle.h>
 #include <cstring>
+#include <cstdio>
 #include <unistd.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 static const char *TAG = "EspSsl";
 
@@ -34,6 +39,46 @@ bool EspSsl::Connect(const std::string& host, int port) {
     esp_tls_cfg_t cfg = {};
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
 
+    // Diagnostic: a connect timeout is indistinguishable from a bad address
+    // unless we know what DNS returned. esp-tls resolves the host internally
+    // through getaddrinfo(), so doing the same lookup here (it hits the cache)
+    // shows exactly the addresses it is about to try, including IPv6, which
+    // would hang the same way on a network without IPv6 connectivity.
+    {
+        struct addrinfo hints = {};
+        struct addrinfo* res = nullptr;
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        char port_str[8];
+        snprintf(port_str, sizeof(port_str), "%d", port);
+
+        int rc = getaddrinfo(host.c_str(), port_str, &hints, &res);
+        if (rc == 0 && res != nullptr) {
+            int n = 0;
+            for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
+                char ip[INET6_ADDRSTRLEN] = {0};
+                if (p->ai_family == AF_INET) {
+                    inet_ntop(AF_INET, &((struct sockaddr_in*)p->ai_addr)->sin_addr,
+                              ip, sizeof(ip));
+                    ESP_LOGI(TAG, "Resolved %s -> %s (IPv4)", host.c_str(), ip);
+                } else if (p->ai_family == AF_INET6) {
+                    inet_ntop(AF_INET6, &((struct sockaddr_in6*)p->ai_addr)->sin6_addr,
+                              ip, sizeof(ip));
+                    ESP_LOGI(TAG, "Resolved %s -> %s (IPv6)", host.c_str(), ip);
+                } else {
+                    ESP_LOGI(TAG, "Resolved %s -> family %d", host.c_str(), p->ai_family);
+                }
+                n++;
+            }
+            freeaddrinfo(res);
+            if (n == 0) {
+                ESP_LOGW(TAG, "getaddrinfo(%s) returned no addresses", host.c_str());
+            }
+        } else {
+            ESP_LOGW(TAG, "getaddrinfo(%s:%s) failed, rc=%d", host.c_str(), port_str, rc);
+        }
+    }
+
     int ret = esp_tls_conn_new_sync(host.c_str(), host.length(), port, &cfg, tls_client_);
     if (ret != 1) {
         esp_tls_error_handle_t last_error;
@@ -41,7 +86,12 @@ bool EspSsl::Connect(const std::string& host, int port) {
             int error_code, error_flags;
             esp_err_t err = esp_tls_get_and_clear_last_error(last_error, &error_code, &error_flags);
             last_error_ = err;
-            ESP_LOGE(TAG, "Failed to connect to %s:%d, code=0x%x", host.c_str(), port, err);
+            // error_code carries the real reason: a socket errno such as
+            // 110 ETIMEDOUT / 113 EHOSTUNREACH / 101 ENETUNREACH, or a
+            // negative mbedtls code. err alone is always 0x8006 here and says
+            // nothing about which of the three happened.
+            ESP_LOGE(TAG, "Failed to connect to %s:%d, code=0x%x, error_code=%d, flags=0x%x",
+                     host.c_str(), port, err, error_code, error_flags);
         } else {
             last_error_ = -1;
             ESP_LOGE(TAG, "Failed to get error handle");

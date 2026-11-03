@@ -25,15 +25,158 @@
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
+#include <lwip/ip_addr.h>
 #include <map>
+#include <mutex>
+#include <string>
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define TAG "MyBoard"
 #define NVS_SNIFFER_NAMESPACE "sniffer"
 #define MAX_SNIFFER_LOG 100
 
+// Defined next to the DNS hook at the bottom of this file: they resolve host
+// names over DNS-over-HTTPS and are used by the board constructor and by the
+// self.net.doh tool.
+void StartDohRefreshTask();
+std::string ResolveViaDohTool(const std::string& host);
+
 static const wifi_promiscuous_filter_t filter = {
     .filter_mask = WIFI_PROMIS_FILTER_MASK_DATA
 };
+
+// Raw TCP handshake probe, exposed as the self.net.probe tool.
+//
+// esp-tls reports a refused or filtered connection as a single generic
+// "Failed to open new connection in specified timeout" after 10 s, which
+// cannot tell "the host is down" from "the port is filtered" from "DNS gave a
+// black-holed address". Doing the handshake by hand records what DNS returned,
+// how long each SYN waited and the exact errno, so the answer comes from the
+// device itself instead of from a machine on a different network.
+static std::string ProbeHost(const std::string& host, int port, int timeout_ms) {
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;  // IPv6 first if the stack prefers it
+    hints.ai_socktype = SOCK_STREAM;
+
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "host", host.c_str());
+    cJSON_AddNumberToObject(root, "port", port);
+    cJSON_AddNumberToObject(root, "timeout_ms", timeout_ms);
+
+    cJSON* resolved = cJSON_AddArrayToObject(root, "resolved");
+
+    int64_t started_us = esp_timer_get_time();
+    struct addrinfo* res = nullptr;
+    int rc = getaddrinfo(host.c_str(), port_str, &hints, &res);
+    int64_t dns_ms = (esp_timer_get_time() - started_us) / 1000;
+
+    if (rc != 0 || res == nullptr) {
+        cJSON_AddNumberToObject(root, "dns_ms", dns_ms);
+        cJSON_AddNumberToObject(root, "dns_rc", rc);
+        cJSON_AddBoolToObject(root, "ok", false);
+        char* printed = cJSON_PrintUnformatted(root);
+        std::string out = printed ? printed : "{\"error\":\"dns failed\"}";
+        cJSON_free(printed);
+        cJSON_Delete(root);
+        return out;
+    }
+
+    int64_t deadline_us = started_us + static_cast<int64_t>(timeout_ms) * 1000;
+    bool connected = false;
+    cJSON* attempts = cJSON_AddArrayToObject(root, "attempts");
+
+    for (struct addrinfo* p = res; p != nullptr; p = p->ai_next) {
+        char ip[INET6_ADDRSTRLEN] = {0};
+        if (p->ai_family == AF_INET) {
+            inet_ntop(AF_INET, &((struct sockaddr_in*)p->ai_addr)->sin_addr, ip, sizeof(ip));
+        } else if (p->ai_family == AF_INET6) {
+            inet_ntop(AF_INET6, &((struct sockaddr_in6*)p->ai_addr)->sin6_addr, ip, sizeof(ip));
+        }
+        cJSON_AddItemToArray(resolved, cJSON_CreateString(ip));
+
+        int64_t remain_us = deadline_us - esp_timer_get_time();
+        if (remain_us <= 0) {
+            break;  // the budget is spent, later addresses have no chance
+        }
+
+        int fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+        if (fd < 0) {
+            cJSON* a = cJSON_CreateObject();
+            cJSON_AddItemToArray(attempts, a);
+            cJSON_AddStringToObject(a, "ip", ip);
+            cJSON_AddStringToObject(a, "stage", "socket");
+            cJSON_AddNumberToObject(a, "errno", errno);
+            cJSON_AddStringToObject(a, "error", strerror(errno));
+            continue;
+        }
+
+        int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+        int64_t t0 = esp_timer_get_time();
+        int ret = connect(fd, p->ai_addr, p->ai_addrlen);
+        int err = 0;
+
+        if (ret < 0 && errno == EINPROGRESS) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            struct timeval tv;
+            int64_t remain_ms = remain_us / 1000;
+            tv.tv_sec = static_cast<time_t>(remain_ms / 1000);
+            tv.tv_usec = static_cast<suseconds_t>((remain_ms % 1000) * 1000);
+
+            ret = select(fd + 1, nullptr, &wfds, nullptr, &tv);
+            if (ret > 0) {
+                socklen_t len = sizeof(err);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+            } else if (ret == 0) {
+                err = ETIMEDOUT;  // SYN never answered within the budget
+            } else {
+                err = errno;
+            }
+        } else if (ret != 0) {
+            err = errno;  // immediate refusal / unreachable / no route
+        }
+
+        int64_t elapsed_ms = (esp_timer_get_time() - t0) / 1000;
+        close(fd);
+
+        cJSON* a = cJSON_CreateObject();
+        cJSON_AddItemToArray(attempts, a);
+        cJSON_AddStringToObject(a, "ip", ip);
+        cJSON_AddNumberToObject(a, "ms", elapsed_ms);
+        cJSON_AddNumberToObject(a, "errno", err);
+        cJSON_AddStringToObject(a, "error", err == 0 ? "connected" : strerror(err));
+
+        if (err == 0) {
+            connected = true;
+            break;  // one working address is enough
+        }
+    }
+
+    freeaddrinfo(res);
+
+    cJSON_AddNumberToObject(root, "dns_ms", dns_ms);
+    cJSON_AddBoolToObject(root, "ok", connected);
+    char* printed = cJSON_PrintUnformatted(root);
+    std::string out = printed ? printed : "{\"error\":\"out of memory\"}";
+    cJSON_free(printed);
+    cJSON_Delete(root);
+    return out;
+}
 
 class MyBoard : public WifiBoard {
 private:
@@ -275,6 +418,14 @@ public:
         boot_button_(BOOT_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+        // Diagnostic: esp-tls hides the connect/handshake stages behind
+        // ESP_LOGD, which is compiled out at CONFIG_LOG_MAXIMUM_LEVEL=3. With
+        // the maximum raised to 4 (the default level stays INFO, so nothing
+        // else gets noisier) this shows the exact address esp-tls picks and
+        // whether it ever reaches the TLS handshake.
+        esp_log_level_set("esp-tls", ESP_LOG_DEBUG);
+        esp_log_level_set("EspSsl", ESP_LOG_DEBUG);
+
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeSpi();
@@ -283,6 +434,10 @@ public:
         GetBacklight()->RestoreBrightness();
 
         InitializeTools();
+
+        // Refresh the DNS-over-HTTPS answers in the background; without them
+        // the market tools connect to a dead Yahoo edge address.
+        StartDohRefreshTask();
 
         // Load persisted sniffer log from NVS
         LoadSnifferLogFromNvs();
@@ -1240,6 +1395,59 @@ public:
                     properties["asset"].value<std::string>(),
                     properties["interval_sec"].value<int>());
             });
+
+        // Connectivity diagnosis from the device itself. The market tools fail
+        // with a generic "connection failed" that says nothing about which hop
+        // is broken; this runs a plain TCP handshake and reports the resolved
+        // addresses, the wait per address and the errno.
+        mcp_server.AddTool("self.net.probe",
+            "Test raw TCP connectivity from the device to a host and port. Use it "
+            "when another network tool fails with a generic connection error: it "
+            "reports every address DNS returned, how long the handshake waited "
+            "and the exact errno, which tells 'host is down' and 'port is "
+            "filtered' apart.\n"
+            "Args:\n"
+            "  `host`: hostname or IP address.\n"
+            "  `port`: TCP port, 1-65535, defaults to 443.\n"
+            "  `timeout_ms`: total budget for the whole attempt, 1000-15000, "
+            "defaults to 5000.\n"
+            "Returns: JSON with `ok`, `dns_ms`, `resolved` (all IPs) and "
+            "`attempts` (ip, ms, errno, error per address).",
+            PropertyList({
+                Property("host", kPropertyTypeString, std::string("")),
+                Property("port", kPropertyTypeInteger, 443, 1, 65535),
+                Property("timeout_ms", kPropertyTypeInteger, 5000, 1000, 15000)
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                std::string host = properties["host"].value<std::string>();
+                if (host.empty()) {
+                    return std::string("{\"error\":\"host is required\"}");
+                }
+                return ProbeHost(host,
+                                 properties["port"].value<int>(),
+                                 properties["timeout_ms"].value<int>());
+            });
+
+        // Diagnoses the class of failure where the local resolver hands out an
+        // address that accepts TCP but never completes a TLS handshake. The
+        // lookup goes over HTTPS to cloudflare-dns.com, so it bypasses the
+        // local resolver entirely.
+        mcp_server.AddTool("self.net.doh",
+            "Resolve a hostname through DNS-over-HTTPS (cloudflare-dns.com) instead "
+            "of the local resolver, and show what address the device would actually "
+            "connect to. Use it when a host fails to connect while a plain TCP test "
+            "to the same address succeeds: that means the local resolver returned a "
+            "stale or hijacked address.\n"
+            "Args:\n"
+            "  `host`: hostname to resolve.\n"
+            "Returns: JSON with `ok`, `ip` from the live DoH answer and `cached`, "
+            "the address currently served by the device.",
+            PropertyList({
+                Property("host", kPropertyTypeString, std::string(""))
+            }),
+            [this](const PropertyList& properties) -> ReturnValue {
+                return ResolveViaDohTool(properties["host"].value<std::string>());
+            });
     }
 
     virtual AudioCodec* GetAudioCodec() override {
@@ -1289,6 +1497,200 @@ std::vector<MyBoard::SnifferPacket> MyBoard::sniffer_log_;
 int MyBoard::sniffer_duration_seconds_ = 10;
 std::vector<MyBoard::DnsQuery> MyBoard::dns_log_;
 
+// ---------- DNS-over-HTTPS fallback for hosts with stale resolver answers ----------
+//
+// Yahoo rotates its edge pool, but the resolvers on this network keep handing
+// out addresses from an old pool: they accept a TCP connection and then never
+// answer the TLS handshake. From the firmware that is indistinguishable from
+// "Yahoo is blocked", and it made the market tools fail for a reason that had
+// nothing to do with the port, the TLS stack or the Wi-Fi. Resolving those
+// hosts over HTTPS gets a live address instead, and the hook below hands it to
+// lwip so every consumer (esp-tls, the HTTP client, our own getaddrinfo) uses
+// it while the SNI still carries the real hostname.
+namespace {
+
+struct DohEntry {
+    ip_addr_t addr;
+};
+
+std::map<std::string, DohEntry> g_doh_cache;
+std::mutex g_doh_mutex;
+
+// Only these names are answered from DoH; everything else keeps using the
+// router's resolver, which is fine for every other host.
+const char* kDohHosts[] = {
+    "query1.finance.yahoo.com",
+    "query2.finance.yahoo.com",
+};
+
+// One DoH query: GET https://cloudflare-dns.com/dns-query?name=<host>&type=A
+// with Accept: application/dns-json, parsed with cJSON. The body is small
+// (~300 B) but is still streamed, because the HTTP client deadlocks on any
+// response larger than its 8 kB chunk buffer.
+bool ResolveViaDoh(const std::string& host, std::string& ip_out, std::string& error_out) {
+    auto network = Board::GetInstance().GetNetwork();
+    if (network == nullptr) {
+        error_out = "network is not available";
+        return false;
+    }
+
+    auto http = network->CreateHttp(0);
+    http->SetTimeout(15000);
+    http->SetHeader("Accept", "application/dns-json");
+
+    const std::string url =
+        std::string("https://cloudflare-dns.com/dns-query?name=") + host + "&type=A";
+
+    if (!http->Open("GET", url)) {
+        error_out = "the DoH endpoint is unreachable";
+        return false;
+    }
+
+    int status_code = http->GetStatusCode();
+    if (status_code != 200) {
+        http->Close();
+        error_out = "DoH endpoint replied HTTP " + std::to_string(status_code);
+        return false;
+    }
+
+    std::string body;
+    char buffer[1024];
+    while (true) {
+        int bytes_read = http->Read(buffer, sizeof(buffer));
+        if (bytes_read < 0) {
+            http->Close();
+            error_out = "the DoH response was reset";
+            return false;
+        }
+        if (bytes_read == 0) {
+            break;
+        }
+        body.append(buffer, static_cast<size_t>(bytes_read));
+        if (body.size() > 16 * 1024) {
+            break;
+        }
+    }
+    http->Close();
+
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) {
+        error_out = "failed to parse the DoH response";
+        return false;
+    }
+
+    bool found = false;
+    cJSON* answers = cJSON_GetObjectItem(root, "Answer");
+    if (cJSON_IsArray(answers)) {
+        for (cJSON* item = answers->child; item != nullptr; item = item->next) {
+            cJSON* type = cJSON_GetObjectItem(item, "type");
+            cJSON* data = cJSON_GetObjectItem(item, "data");
+            // type 1 = A record; CNAMEs (type 5) are walked past.
+            if (cJSON_IsNumber(type) && (int)type->valuedouble == 1 && cJSON_IsString(data)) {
+                ip_addr_t parsed;
+                if (ipaddr_aton(data->valuestring, &parsed) && IP_IS_V4(&parsed)) {
+                    ip_out = data->valuestring;
+                    found = true;
+                    break;
+                }
+            }
+        }
+    }
+    cJSON_Delete(root);
+
+    if (!found) {
+        error_out = "the DoH answer contains no A record";
+        return false;
+    }
+    return true;
+}
+
+void StoreDohAnswer(const std::string& host, const std::string& ip) {
+    ip_addr_t parsed;
+    if (!ipaddr_aton(ip.c_str(), &parsed) || !IP_IS_V4(&parsed)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_doh_mutex);
+    g_doh_cache[host] = DohEntry{parsed};
+}
+
+void DohRefreshTask(void*) {
+    const TickType_t kSteadyInterval = pdMS_TO_TICKS(10 * 60 * 1000);
+    // Wi-Fi is usually up ~8 s after boot, so the first pass often runs before
+    // there is a network. Retrying quickly until something resolves keeps the
+    // cache from staying empty for a whole ten minute interval.
+    const TickType_t kRetryInterval = pdMS_TO_TICKS(15000);
+
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    for (;;) {
+        int resolved = 0;
+        for (const char* host : kDohHosts) {
+            std::string ip;
+            std::string error;
+            if (ResolveViaDoh(host, ip, error)) {
+                StoreDohAnswer(host, ip);
+                ESP_LOGI("DNS_HOOK", "DoH: %s -> %s", host, ip.c_str());
+                resolved++;
+            } else {
+                // Not fatal: an empty cache simply means the local resolver is
+                // used for that name, exactly as before.
+                ESP_LOGW("DNS_HOOK", "DoH lookup for %s failed: %s", host, error.c_str());
+            }
+        }
+        vTaskDelay(resolved > 0 ? kSteadyInterval : kRetryInterval);
+    }
+}
+
+}  // namespace
+
+void StartDohRefreshTask() {
+    // 12 kB of stack: this task runs an HTTPS request and a cJSON parse.
+    xTaskCreate(DohRefreshTask, "doh_refresh", 12288, nullptr, 3, nullptr);
+}
+
+// Runs the same lookup on demand for the self.net.doh diagnostic tool.
+std::string ResolveViaDohTool(const std::string& host) {
+    if (host.empty()) {
+        return "{\"error\":\"host is required\"}";
+    }
+
+    // Report the address the cache would hand out, so the tool shows both
+    // what DoH says right now and what the device would actually connect to.
+    std::string cached;
+    {
+        std::lock_guard<std::mutex> lock(g_doh_mutex);
+        auto it = g_doh_cache.find(host);
+        if (it != g_doh_cache.end()) {
+            char buf[INET6_ADDRSTRLEN] = {0};
+            ipaddr_ntoa_r(&it->second.addr, buf, sizeof(buf));
+            cached = buf;
+        }
+    }
+
+    std::string ip;
+    std::string error;
+    cJSON* root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "host", host.c_str());
+    cJSON_AddStringToObject(root, "resolver", "cloudflare-dns.com");
+
+    if (ResolveViaDoh(host, ip, error)) {
+        cJSON_AddBoolToObject(root, "ok", true);
+        cJSON_AddStringToObject(root, "ip", ip.c_str());
+        StoreDohAnswer(host, ip);
+    } else {
+        cJSON_AddBoolToObject(root, "ok", false);
+        cJSON_AddStringToObject(root, "error", error.c_str());
+    }
+    if (!cached.empty()) {
+        cJSON_AddStringToObject(root, "cached", cached.c_str());
+    }
+
+    char* printed = cJSON_PrintUnformatted(root);
+    std::string out = printed ? printed : "{\"error\":\"out of memory\"}";
+    cJSON_free(printed);
+    cJSON_Delete(root);
+    return out;
+}
+
 extern "C" int lwip_hook_dns_external_resolve(const char* name, ip_addr_t* addr,
                                                dns_found_callback found, void* callback_arg,
                                                u8_t addrtype, err_t* err) {
@@ -1299,6 +1701,23 @@ extern "C" int lwip_hook_dns_external_resolve(const char* name, ip_addr_t* addr,
             MyBoard::dns_log_.erase(MyBoard::dns_log_.begin());
         }
         ESP_LOGI("DNS_HOOK", "Query: %s", name);
+
+        // Hand out a DoH answer when we have one for this name. Returning 1
+        // with ERR_OK means "already resolved, *addr is valid", which is the
+        // same contract a cache hit in dns.c uses, so getaddrinfo() and the
+        // HTTP client pick it up without ever asking the local resolver.
+        if (addr != nullptr && addrtype != LWIP_DNS_ADDRTYPE_IPV6) {
+            std::lock_guard<std::mutex> lock(g_doh_mutex);
+            auto it = g_doh_cache.find(name);
+            if (it != g_doh_cache.end()) {
+                ip_addr_copy(*addr, it->second.addr);
+                char buf[INET6_ADDRSTRLEN] = {0};
+                ipaddr_ntoa_r(&it->second.addr, buf, sizeof(buf));
+                ESP_LOGI("DNS_HOOK", "%s -> %s (from DoH)", name, buf);
+                *err = ERR_OK;
+                return 1;
+            }
+        }
     }
     return 0;  // 0 = don't consume, let normal DNS resolution continue
 }
