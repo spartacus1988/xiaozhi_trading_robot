@@ -36,6 +36,12 @@
 
 #define TAG "MarketNotifier"
 
+// Defined in my_board.cc: reports which DNS-over-HTTPS address was served for
+// `host` right before its TLS handshake failed, so the cache can stop using
+// it. Kept as a plain extern because the DoH cache lives with the board's DNS
+// hook, not with the market code.
+extern void DohNoteConnectFailure(const char* host);
+
 namespace {
 
 // A cycle called from self.market.analyze and one called by the monitor task
@@ -184,6 +190,10 @@ bool FetchOhlcv(const AssetConfig& cfg,
         http->SetHeader("User-Agent", "Mozilla/5.0");
 
         if (!http->Open("GET", url)) {
+            // The address the DNS hook served for this host is the one
+            // esp-tls tried and gave up on; telling the DoH cache about it
+            // stops it from being offered again for the next half hour.
+            DohNoteConnectFailure(host);
             ESP_LOGW(TAG, "Open failed on %s, %s", host,
                      attempt + 1 < kYahooHostCount ? "trying the fallback host"
                                                    : "no hosts left");

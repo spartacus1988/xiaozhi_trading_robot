@@ -27,9 +27,11 @@
 #include <esp_sleep.h>
 #include <esp_timer.h>
 #include <lwip/ip_addr.h>
+#include <algorithm>
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -1509,11 +1511,23 @@ std::vector<MyBoard::DnsQuery> MyBoard::dns_log_;
 // it while the SNI still carries the real hostname.
 namespace {
 
-struct DohEntry {
+struct DohAddr {
     ip_addr_t addr;
+    uint32_t key;  // the IPv4 address as a u32, its identity in the bad list
 };
 
-std::map<std::string, DohEntry> g_doh_cache;
+struct DohPool {
+    std::vector<DohAddr> addrs;
+    size_t next = 0;  // round-robin cursor
+};
+
+std::map<std::string, DohPool> g_doh_cache;
+// Addresses that refused to complete a TLS handshake -> epoch seconds until
+// which they must not be handed out again.
+std::map<uint32_t, uint32_t> g_bad_until;
+// The address most recently served for a name, so that a failed connection
+// can be attributed to the exact address that caused it.
+std::map<std::string, uint32_t> g_last_served;
 std::mutex g_doh_mutex;
 
 // Only these names are answered from DoH; everything else keeps using the
@@ -1523,11 +1537,38 @@ const char* kDohHosts[] = {
     "query2.finance.yahoo.com",
 };
 
+// A dead address is skipped for half an hour, which is long enough for the
+// pool to move on and short enough to recover if it was a transient failure.
+constexpr uint32_t kBadAddressSeconds = 30 * 60;
+
+uint32_t NowSec() {
+    return static_cast<uint32_t>(esp_timer_get_time() / 1000000);
+}
+
+uint32_t KeyOf(const ip_addr_t& addr) {
+    return ip4_addr_get_u32(ip_2_ip4(&addr));
+}
+
+std::string KeyToString(uint32_t key) {
+    ip4_addr_t ip4;
+    ip4_addr_set_u32(&ip4, key);
+    ip_addr_t addr;
+    ip_addr_copy_from_ip4(addr, ip4);
+    char buf[INET6_ADDRSTRLEN] = {0};
+    ipaddr_ntoa_r(&addr, buf, sizeof(buf));
+    return buf;
+}
+
 // One DoH query: GET https://cloudflare-dns.com/dns-query?name=<host>&type=A
 // with Accept: application/dns-json, parsed with cJSON. The body is small
 // (~300 B) but is still streamed, because the HTTP client deadlocks on any
 // response larger than its 8 kB chunk buffer.
-bool ResolveViaDoh(const std::string& host, std::string& ip_out, std::string& error_out) {
+//
+// Every A record in the answer is kept: esp-tls connects to the first address
+// it is given and never tries the rest, so the caller has to be able to offer
+// the next one when the first refuses to speak TLS.
+bool ResolveViaDoh(const std::string& host, std::vector<std::string>& ips_out,
+                   std::string& error_out) {
     auto network = Board::GetInstance().GetNetwork();
     if (network == nullptr) {
         error_out = "network is not available";
@@ -1578,7 +1619,7 @@ bool ResolveViaDoh(const std::string& host, std::string& ip_out, std::string& er
         return false;
     }
 
-    bool found = false;
+    ips_out.clear();
     cJSON* answers = cJSON_GetObjectItem(root, "Answer");
     if (cJSON_IsArray(answers)) {
         for (cJSON* item = answers->child; item != nullptr; item = item->next) {
@@ -1588,29 +1629,53 @@ bool ResolveViaDoh(const std::string& host, std::string& ip_out, std::string& er
             if (cJSON_IsNumber(type) && (int)type->valuedouble == 1 && cJSON_IsString(data)) {
                 ip_addr_t parsed;
                 if (ipaddr_aton(data->valuestring, &parsed) && IP_IS_V4(&parsed)) {
-                    ip_out = data->valuestring;
-                    found = true;
-                    break;
+                    std::string ip = data->valuestring;
+                    if (std::find(ips_out.begin(), ips_out.end(), ip) == ips_out.end()) {
+                        ips_out.push_back(ip);
+                    }
                 }
             }
         }
     }
     cJSON_Delete(root);
 
-    if (!found) {
+    if (ips_out.empty()) {
         error_out = "the DoH answer contains no A record";
         return false;
     }
     return true;
 }
 
-void StoreDohAnswer(const std::string& host, const std::string& ip) {
-    ip_addr_t parsed;
-    if (!ipaddr_aton(ip.c_str(), &parsed) || !IP_IS_V4(&parsed)) {
+void StoreDohPool(const std::string& host, const std::vector<std::string>& ips) {
+    DohPool pool;
+    for (const std::string& ip : ips) {
+        ip_addr_t parsed;
+        if (!ipaddr_aton(ip.c_str(), &parsed) || !IP_IS_V4(&parsed)) {
+            continue;
+        }
+        DohAddr entry{parsed, KeyOf(parsed)};
+        bool duplicate = false;
+        for (const DohAddr& existing : pool.addrs) {
+            if (existing.key == entry.key) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            pool.addrs.push_back(entry);
+        }
+    }
+    if (pool.addrs.empty()) {
         return;
     }
     std::lock_guard<std::mutex> lock(g_doh_mutex);
-    g_doh_cache[host] = DohEntry{parsed};
+    // A refresh must not reset the cursor of a pool another task is walking
+    // through, so only the address list is replaced.
+    auto it = g_doh_cache.find(host);
+    if (it != g_doh_cache.end() && !it->second.addrs.empty()) {
+        pool.next = it->second.next % pool.addrs.size();
+    }
+    g_doh_cache[host] = std::move(pool);
 }
 
 void DohRefreshTask(void*) {
@@ -1624,11 +1689,15 @@ void DohRefreshTask(void*) {
     for (;;) {
         int resolved = 0;
         for (const char* host : kDohHosts) {
-            std::string ip;
+            std::vector<std::string> ips;
             std::string error;
-            if (ResolveViaDoh(host, ip, error)) {
-                StoreDohAnswer(host, ip);
-                ESP_LOGI("DNS_HOOK", "DoH: %s -> %s", host, ip.c_str());
+            if (ResolveViaDoh(host, ips, error)) {
+                StoreDohPool(host, ips);
+                std::string joined;
+                for (const std::string& ip : ips) {
+                    joined += (joined.empty() ? "" : ", ") + ip;
+                }
+                ESP_LOGI("DNS_HOOK", "DoH: %s -> %s", host, joined.c_str());
                 resolved++;
             } else {
                 // Not fatal: an empty cache simply means the local resolver is
@@ -1640,7 +1709,63 @@ void DohRefreshTask(void*) {
     }
 }
 
+// Serves the next address of the pool that is not currently marked bad. The
+// cursor only moves forward, so two lookups in a row get two different
+// addresses instead of the same dead one twice.
+bool PickDohAddress(const std::string& host, ip_addr_t& out) {
+    auto it = g_doh_cache.find(host);
+    if (it == g_doh_cache.end() || it->second.addrs.empty()) {
+        return false;
+    }
+    DohPool& pool = it->second;
+    uint32_t now = NowSec();
+
+    for (size_t i = 0; i < pool.addrs.size(); ++i) {
+        size_t idx = (pool.next + i) % pool.addrs.size();
+        auto bad = g_bad_until.find(pool.addrs[idx].key);
+        if (bad == g_bad_until.end() || now >= bad->second) {
+            pool.next = (idx + 1) % pool.addrs.size();
+            out = pool.addrs[idx].addr;
+            g_last_served[host] = pool.addrs[idx].key;
+            return true;
+        }
+    }
+
+    // Everything in the pool is currently marked bad. Serving the next address
+    // anyway is better than failing the lookup outright: the marks may be
+    // stale, and the caller will simply mark it again if it is not.
+    size_t idx = pool.next % pool.addrs.size();
+    pool.next = (idx + 1) % pool.addrs.size();
+    out = pool.addrs[idx].addr;
+    g_last_served[host] = pool.addrs[idx].key;
+    return true;
+}
+
 }  // namespace
+
+// Called by the market fetch when a connection to `host` could not be opened.
+// The address the DNS hook served for that host is the one esp-tls tried, and
+// esp-tls only ever tries the first address it gets, so the two always refer
+// to the same connection.
+void DohNoteConnectFailure(const char* host) {
+    if (host == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_doh_mutex);
+    auto served = g_last_served.find(host);
+    if (served == g_last_served.end()) {
+        return;
+    }
+    auto& until = g_bad_until[served->second];
+    uint32_t now = NowSec();
+    if (until > now) {
+        return;  // already marked by an earlier failure
+    }
+    until = now + kBadAddressSeconds;
+    ESP_LOGW("DNS_HOOK", "%s: %s refused a TLS handshake, skipping it for %u min",
+             host, KeyToString(served->second).c_str(),
+             static_cast<unsigned>(kBadAddressSeconds / 60));
+}
 
 void StartDohRefreshTask() {
     // 12 kB of stack: this task runs an HTTPS request and a cJSON parse.
@@ -1653,35 +1778,38 @@ std::string ResolveViaDohTool(const std::string& host) {
         return "{\"error\":\"host is required\"}";
     }
 
-    // Report the address the cache would hand out, so the tool shows both
-    // what DoH says right now and what the device would actually connect to.
-    std::string cached;
+    // Report what the device would actually connect to, so the tool shows the
+    // live DoH answer and the address the next lookup would be served.
+    std::string next_up;
     {
         std::lock_guard<std::mutex> lock(g_doh_mutex);
-        auto it = g_doh_cache.find(host);
-        if (it != g_doh_cache.end()) {
+        ip_addr_t picked;
+        if (PickDohAddress(host, picked)) {
             char buf[INET6_ADDRSTRLEN] = {0};
-            ipaddr_ntoa_r(&it->second.addr, buf, sizeof(buf));
-            cached = buf;
+            ipaddr_ntoa_r(&picked, buf, sizeof(buf));
+            next_up = buf;
         }
     }
 
-    std::string ip;
+    std::vector<std::string> ips;
     std::string error;
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "host", host.c_str());
     cJSON_AddStringToObject(root, "resolver", "cloudflare-dns.com");
 
-    if (ResolveViaDoh(host, ip, error)) {
+    if (ResolveViaDoh(host, ips, error)) {
+        StoreDohPool(host, ips);
         cJSON_AddBoolToObject(root, "ok", true);
-        cJSON_AddStringToObject(root, "ip", ip.c_str());
-        StoreDohAnswer(host, ip);
+        cJSON* list = cJSON_AddArrayToObject(root, "ips");
+        for (const std::string& ip : ips) {
+            cJSON_AddItemToArray(list, cJSON_CreateString(ip.c_str()));
+        }
     } else {
         cJSON_AddBoolToObject(root, "ok", false);
         cJSON_AddStringToObject(root, "error", error.c_str());
     }
-    if (!cached.empty()) {
-        cJSON_AddStringToObject(root, "cached", cached.c_str());
+    if (!next_up.empty()) {
+        cJSON_AddStringToObject(root, "next_address", next_up.c_str());
     }
 
     char* printed = cJSON_PrintUnformatted(root);
@@ -1708,11 +1836,11 @@ extern "C" int lwip_hook_dns_external_resolve(const char* name, ip_addr_t* addr,
         // HTTP client pick it up without ever asking the local resolver.
         if (addr != nullptr && addrtype != LWIP_DNS_ADDRTYPE_IPV6) {
             std::lock_guard<std::mutex> lock(g_doh_mutex);
-            auto it = g_doh_cache.find(name);
-            if (it != g_doh_cache.end()) {
-                ip_addr_copy(*addr, it->second.addr);
+            ip_addr_t picked;
+            if (PickDohAddress(name, picked)) {
+                ip_addr_copy(*addr, picked);
                 char buf[INET6_ADDRSTRLEN] = {0};
-                ipaddr_ntoa_r(&it->second.addr, buf, sizeof(buf));
+                ipaddr_ntoa_r(&picked, buf, sizeof(buf));
                 ESP_LOGI("DNS_HOOK", "%s -> %s (from DoH)", name, buf);
                 *err = ERR_OK;
                 return 1;
