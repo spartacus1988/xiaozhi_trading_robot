@@ -1366,14 +1366,18 @@ public:
             "Start, stop or inspect the background market monitor: a task that keeps "
             "analyzing the market on its own every `interval_sec` seconds, without "
             "waiting for anyone to ask.\n"
-            "While it runs the device shows a message on its display (no sound) only "
+            "While it runs the device plays a sound and shows a message on its display "
             "when the trading bot actually opens or closes a position (BUY, "
-            "STRONG_BUY, STOP_LOSS, TAKE_PROFIT, SELL, TIME_EXIT). Such a trade is "
-            "also queued for the assistant: as soon as the device is idle, the "
-            "report is injected as a wake word text and you speak it to the user - "
-            "the action taken, the full analysis report and, on an exit, the "
-            "profit or loss of the trade. HOLD and WAIT announce nothing at all, "
-            "so a running monitor makes no noise in a quiet market.\n"
+            "STRONG_BUY, STOP_LOSS, TAKE_PROFIT, SELL, TIME_EXIT). After such a "
+            "trade the device also speaks a SHORT signal of its own, like "
+            "`торговый бот: покупка` or `торговый бот: продажа`. Treat that "
+            "signal as a trigger: call this tool with `action`: `status` and "
+            "read the result aloud to the user - `last_event` says what was "
+            "bought or sold (with the profit or loss on a sale) and "
+            "`last_report` is the full analysis report, exactly as you read it "
+            "after a manual `self.market.analyze`. HOLD and WAIT announce "
+            "nothing at all, so a running monitor makes no noise in a quiet "
+            "market.\n"
             "The monitor is held in RAM and is lost on reboot; the bot's money and "
             "position state are not, they survive in flash.\n"
             "Args:\n"
@@ -1383,8 +1387,9 @@ public:
             "  `interval_sec`: polling period for `start`, 10-3600 seconds, "
             "defaults to 60.\n"
             "Returns: for `start` the first full analysis report plus a `monitor` "
-            "object; otherwise a `monitor` object with `running`, `asset` and "
-            "`interval_sec`.",
+            "object; otherwise a `monitor` object with `running`, `asset`, "
+            "`interval_sec`, plus `last_event` and `last_report` of the most "
+            "recent monitor cycle.",
             PropertyList({
                 Property("action", kPropertyTypeString, std::string("start")),
                 Property("asset", kPropertyTypeString, std::string("btc")),

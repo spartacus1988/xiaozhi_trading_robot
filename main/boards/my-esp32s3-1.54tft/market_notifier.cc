@@ -53,11 +53,16 @@ std::mutex g_cycle_mutex;
 // A monitor trade has to be spoken by the assistant, but the assistant can
 // only talk through an open conversation, and a running conversation must not
 // be interrupted by an injected wake word (the server drops the session when
-// it sees a listen.detect mid-dialogue). Events are therefore parked here and
-// handed to Application::WakeWordInvoke() once the device is idle again, see
-// DrainAnnouncements().
+// it sees a listen.detect mid-dialogue). The short wake word signal for a
+// trade is therefore parked here and handed to
+// Application::WakeWordInvoke() once the device is idle again, see
+// DrainAnnouncements(). The full report travels the other way round: it is
+// kept in g_last_report and read by the assistant through
+// self.market.monitor (action=status).
 std::mutex g_announce_mutex;
 std::vector<std::string> g_announcements;
+std::string g_last_event;   // human readable description of the last trade
+std::string g_last_report;  // full JSON report of the last monitor cycle
 
 // ---------- Settings (from the "НАСТРОЙКИ" block of main.py) ----------
 struct AssetConfig {
@@ -612,18 +617,18 @@ void EnqueueAnnouncement(std::string text) {
 // STOP_LOSS, TAKE_PROFIT, SELL and TIME_EXIT announce themselves, while HOLD
 // and WAIT announce nothing at all.
 //
-// What happens on a real trade depends on where the cycle came from:
-//  - a direct self.market.analyze call: the assistant reads the report aloud
-//    as soon as the tool returns, so the trade only needs the local popup and
-//    the confirmation beep;
-//  - the background monitor: the assistant is not in a dialogue, so the beep
-//    is dropped (the popup stays) and the whole report - the same JSON the
-//    assistant reads after a manual analysis - is queued for the assistant to
-//    speak, together with the action taken and, on an exit, the PnL of the
-//    closed trade. See EnqueueAnnouncement()/DrainAnnouncements().
+// What happens on a real trade:
+//  - the popup and the beep stay exactly as they were, in both paths;
+//  - a cycle from the background monitor additionally wakes the assistant
+//    with a *short* signal ("торговый бот: покупка"). The server rejects
+//    anything longer in a listen.detect ("Detect is only for wake word, do
+//    not send long text"), so the full report travels the other way round:
+//    on that signal the assistant calls self.market.monitor with
+//    action=status and reads the last_report it returns, exactly like it
+//    reads the result of a manual self.market.analyze call.
 void NotifyTrade(const AssetConfig* cfg, const char* action, int score,
                  double price, double pnl_pct, double pnl_usd, double hold_min,
-                 const BotState& state, bool announce, const std::string& report) {
+                 const BotState& state, bool announce) {
     const bool is_entry = strcmp(action, "BUY") == 0 || strcmp(action, "STRONG_BUY") == 0;
     const bool is_exit  = strcmp(action, "STOP_LOSS") == 0 || strcmp(action, "TAKE_PROFIT") == 0 ||
                           strcmp(action, "SELL") == 0 || strcmp(action, "TIME_EXIT") == 0;
@@ -651,58 +656,21 @@ void NotifyTrade(const AssetConfig* cfg, const char* action, int score,
     }
 
     auto& app = Application::GetInstance();
-    const char* emotion = is_entry ? "happy" : "angry";
-
-    if (!announce) {
-        app.Alert("Market", message, emotion,
-                  is_entry ? Lang::Sounds::OGG_SUCCESS : Lang::Sounds::OGG_EXCLAMATION);
-        return;
-    }
-
-    // Background monitor: no beep, the popup stays on the display, and the
-    // report is queued so that the assistant speaks it instead.
-    app.Alert("Market", message, emotion, "");
-
-    char price_str[32];
-    snprintf(price_str, sizeof(price_str), "%.*f", cfg->decimals, price);
-
-    std::string text = "Торговый бот: ";
     if (is_entry) {
-        text += strcmp(action, "STRONG_BUY") == 0 ? "СИЛЬНАЯ ПОКУПКА (" : "ПОКУПКА (";
-        text += action;
-        text += ") — ";
-        text += cfg->name;
-        text += ", цена ";
-        text += price_str;
-        text += " USD.";
+        app.Alert("Market", message, "happy", Lang::Sounds::OGG_SUCCESS);
     } else {
-        text += "ПРОДАЖА";
-        if (strcmp(action, "STOP_LOSS") == 0) {
-            text += " по стоп-лоссу";
-        } else if (strcmp(action, "TAKE_PROFIT") == 0) {
-            text += " по тейк-профиту";
-        } else if (strcmp(action, "SELL") == 0) {
-            text += " по сигналу";
-        } else {
-            text += " по времени";
-        }
-        text += " (";
-        text += action;
-        text += ") — ";
-        text += cfg->name;
-        char pnl[96];
-        snprintf(pnl, sizeof(pnl), ", результат: %s %.2f USD (%+.2f%%).",
-                 pnl_usd >= 0.0 ? "прибыль" : "убыток", pnl_usd, pnl_pct);
-        text += pnl;
+        app.Alert("Market", message, "angry", Lang::Sounds::OGG_EXCLAMATION);
     }
 
-    // The full analysis report: exactly the JSON the assistant reads after a
-    // manual self.market.analyze call, so the spoken wording stays the same.
-    text += " Отчёт анализа: ";
-    text += report;
-    text += ". Ответь пользователю голосом: назови действие, зачитай полный отчёт анализа и результат сделки.";
-
-    EnqueueAnnouncement(std::move(text));
+    if (announce) {
+        // Remember what the trade was for the monitor status payload, and
+        // queue the short wake word signal for the assistant.
+        {
+            std::lock_guard<std::mutex> lock(g_announce_mutex);
+            g_last_event = message;
+        }
+        EnqueueAnnouncement(is_entry ? "торговый бот: покупка" : "торговый бот: продажа");
+    }
 }
 
 // Hands the oldest parked announcement to the assistant, but only while the
@@ -1079,7 +1047,15 @@ bool RunCycle(const AssetConfig* cfg, bool announce,
              cfg->name, ticker_used.c_str(), dec, price, score, action);
 
     NotifyTrade(cfg, action, score, price, pnl_pct, pnl_usd, hold_time_min,
-                state, announce, result);
+                state, announce);
+
+    if (announce) {
+        // Keep the report of this monitor cycle for self.market.monitor
+        // (action=status), which is how the assistant reads a trade aloud
+        // after the short wake word signal.
+        std::lock_guard<std::mutex> lock(g_announce_mutex);
+        g_last_report = result;
+    }
 
     report = std::move(result);
     return true;
@@ -1150,6 +1126,23 @@ static std::string MonitorJson(bool running, const AssetConfig* cfg,
         cJSON_AddNumberToObject(monitor, "interval_sec", interval_sec);
     }
     cJSON_AddItemToObject(root, "monitor", monitor);
+
+    // What the last monitor cycle did and the full report of it. On a status
+    // call the report is the whole payload the assistant needs to read a
+    // queued trade aloud; on a start call root already carries the fresh
+    // first-cycle report, so only the event description is added there.
+    {
+        std::lock_guard<std::mutex> lock(g_announce_mutex);
+        if (!g_last_event.empty()) {
+            cJSON_AddStringToObject(root, "last_event", g_last_event.c_str());
+        }
+        if (first_report.empty() && !g_last_report.empty()) {
+            cJSON* last_report = cJSON_Parse(g_last_report.c_str());
+            if (last_report != nullptr) {
+                cJSON_AddItemToObject(root, "last_report", last_report);
+            }
+        }
+    }
 
     if (!error.empty()) {
         cJSON_AddStringToObject(root, "error", error.c_str());
