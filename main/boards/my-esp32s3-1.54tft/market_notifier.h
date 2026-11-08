@@ -2,7 +2,9 @@
 #define MARKET_NOTIFIER_H
 
 #include <atomic>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -19,7 +21,8 @@
  *  - Analyze() runs exactly one iteration and is exposed to the LLM as the
  *    `self.market.analyze` MCP tool;
  *  - StartMonitor() spawns a FreeRTOS task repeating the same iteration every
- *    `interval_sec` seconds, which is the device-side equivalent of
+ *    `interval_sec` seconds - for one asset or, by default, for all of them at
+ *    once, which is the device-side equivalent of
  *    `while True: analyze(); time.sleep(INTERVAL)`. It is controlled by the
  *    `self.market.monitor` MCP tool and is not restored after a reboot.
  *
@@ -60,15 +63,18 @@ public:
     std::string Analyze(const std::string& asset);
 
     /**
-     * @brief Start the background monitor for one asset.
+     * @brief Start the background monitor for one asset or for all of them.
      *
-     * The first cycle runs synchronously so the caller immediately gets a
-     * full report back; every following cycle runs in the background task.
+     * The first cycle of every monitored asset runs synchronously so the
+     * caller immediately gets full reports back; every following round runs
+     * in the background task, which walks all monitored assets in turn.
      *
-     * @param asset One of "gold", "btc", "eth", "ltc", "doge" or "trump"
+     * @param asset "all" (the default) monitors every asset, otherwise one of
+     *              "gold", "btc", "eth", "ltc", "doge", "trump"
      *              (case-insensitive).
      * @param interval_sec polling period, clamped to [10, 3600] seconds.
-     * @return JSON with the monitor state merged into the first report.
+     * @return JSON with the monitor state plus one first-cycle report per
+     *         asset under "reports".
      */
     std::string StartMonitor(const std::string& asset, int interval_sec);
 
@@ -86,7 +92,10 @@ private:
     std::atomic<bool> monitor_running_{false};
     std::atomic<bool> monitor_task_alive_{false};
     TaskHandle_t monitor_task_handle_ = nullptr;
-    size_t monitor_asset_index_ = 0;
+    // Guards the two fields below: StartMonitor()/StopMonitor() write them
+    // while the task is stopped, MonitorStatus() and the task read them.
+    std::mutex monitor_cfg_mutex_;
+    std::vector<size_t> monitor_assets_;  // indices into the kAssets table
     int monitor_interval_sec_ = 60;
 };
 

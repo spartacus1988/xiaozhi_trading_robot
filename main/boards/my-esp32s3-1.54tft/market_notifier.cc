@@ -62,7 +62,7 @@ std::mutex g_cycle_mutex;
 std::mutex g_announce_mutex;
 std::vector<std::string> g_announcements;
 std::string g_last_event;   // human readable description of the last trade
-std::string g_last_report;  // full JSON report of the last monitor cycle
+std::string g_last_report;  // full JSON report of the cycle with that trade
 
 // ---------- Settings (from the "НАСТРОЙКИ" block of main.py) ----------
 struct AssetConfig {
@@ -626,14 +626,15 @@ void EnqueueAnnouncement(std::string text) {
 //    on that signal the assistant calls self.market.monitor with
 //    action=status and reads the last_report it returns, exactly like it
 //    reads the result of a manual self.market.analyze call.
-void NotifyTrade(const AssetConfig* cfg, const char* action, int score,
+// @return true when a real trade was announced (HOLD and WAIT return false).
+bool NotifyTrade(const AssetConfig* cfg, const char* action, int score,
                  double price, double pnl_pct, double pnl_usd, double hold_min,
                  const BotState& state, bool announce) {
     const bool is_entry = strcmp(action, "BUY") == 0 || strcmp(action, "STRONG_BUY") == 0;
     const bool is_exit  = strcmp(action, "STOP_LOSS") == 0 || strcmp(action, "TAKE_PROFIT") == 0 ||
                           strcmp(action, "SELL") == 0 || strcmp(action, "TIME_EXIT") == 0;
     if (!is_entry && !is_exit) {
-        return;  // HOLD or WAIT: no sound, no display update
+        return false;  // HOLD or WAIT: no sound, no display update
     }
 
     char message[160];
@@ -671,6 +672,7 @@ void NotifyTrade(const AssetConfig* cfg, const char* action, int score,
         }
         EnqueueAnnouncement(is_entry ? "торговый бот: покупка" : "торговый бот: продажа");
     }
+    return true;
 }
 
 // Hands the oldest parked announcement to the assistant, but only while the
@@ -1046,13 +1048,15 @@ bool RunCycle(const AssetConfig* cfg, bool announce,
     ESP_LOGI(TAG, "%s (%s) price %.*f, score %+d, action %s",
              cfg->name, ticker_used.c_str(), dec, price, score, action);
 
-    NotifyTrade(cfg, action, score, price, pnl_pct, pnl_usd, hold_time_min,
-                state, announce);
+    const bool traded =
+        NotifyTrade(cfg, action, score, price, pnl_pct, pnl_usd, hold_time_min,
+                    state, announce);
 
-    if (announce) {
-        // Keep the report of this monitor cycle for self.market.monitor
-        // (action=status), which is how the assistant reads a trade aloud
-        // after the short wake word signal.
+    if (announce && traded) {
+        // Keep the report of the trade itself for self.market.monitor
+        // (action=status): with several assets monitored in parallel the
+        // last *cycle* may belong to another asset, but this report always
+        // matches the last_event queued just above.
         std::lock_guard<std::mutex> lock(g_announce_mutex);
         g_last_report = result;
     }
@@ -1104,39 +1108,46 @@ std::string MarketNotifier::Analyze(const std::string& asset) {
     return report;
 }
 
-// Serialises the monitor state into the tool payload.
-static std::string MonitorJson(bool running, const AssetConfig* cfg,
+// Serialises the monitor state into the tool payload. `reports`, when given,
+// are the fresh first-cycle reports of a start call and travel as a "reports"
+// array; a status call passes nullptr and gets the stored last_event and
+// last_report of the most recent trade instead.
+static std::string MonitorJson(bool running,
+                               const std::vector<size_t>& indices,
                                int interval_sec, const std::string& error,
-                               const std::string& first_report) {
-    cJSON* root = nullptr;
-
-    // Reuse the first cycle's report as the base so the assistant can read the
-    // analysis aloud right after starting the monitor.
-    if (!first_report.empty()) {
-        root = cJSON_Parse(first_report.c_str());
-    }
-    if (root == nullptr) {
-        root = cJSON_CreateObject();
-    }
+                               const std::vector<std::string>* reports) {
+    cJSON* root = cJSON_CreateObject();
 
     cJSON* monitor = cJSON_CreateObject();
     cJSON_AddBoolToObject(monitor, "running", running);
-    if (cfg != nullptr) {
-        cJSON_AddStringToObject(monitor, "asset", cfg->key);
+    if (!indices.empty()) {
+        cJSON* assets = cJSON_AddArrayToObject(monitor, "assets");
+        for (size_t index : indices) {
+            cJSON_AddItemToArray(assets, cJSON_CreateString(kAssets[index].key));
+        }
+        if (indices.size() == 1) {
+            // Singular alias so a single-asset monitor still reads naturally.
+            cJSON_AddStringToObject(monitor, "asset", kAssets[indices[0]].key);
+        }
         cJSON_AddNumberToObject(monitor, "interval_sec", interval_sec);
     }
     cJSON_AddItemToObject(root, "monitor", monitor);
 
-    // What the last monitor cycle did and the full report of it. On a status
-    // call the report is the whole payload the assistant needs to read a
-    // queued trade aloud; on a start call root already carries the fresh
-    // first-cycle report, so only the event description is added there.
-    {
+    if (reports != nullptr) {
+        cJSON* array = cJSON_AddArrayToObject(root, "reports");
+        for (const auto& text : *reports) {
+            cJSON* parsed = cJSON_Parse(text.c_str());
+            cJSON_AddItemToArray(array,
+                                 parsed != nullptr ? parsed : cJSON_CreateString(text.c_str()));
+        }
+    } else {
+        // What the last monitor cycle did and the full report of it: the
+        // whole payload the assistant needs to read a queued trade aloud.
         std::lock_guard<std::mutex> lock(g_announce_mutex);
         if (!g_last_event.empty()) {
             cJSON_AddStringToObject(root, "last_event", g_last_event.c_str());
         }
-        if (first_report.empty() && !g_last_report.empty()) {
+        if (!g_last_report.empty()) {
             cJSON* last_report = cJSON_Parse(g_last_report.c_str());
             if (last_report != nullptr) {
                 cJSON_AddItemToObject(root, "last_report", last_report);
@@ -1156,34 +1167,68 @@ static std::string MonitorJson(bool running, const AssetConfig* cfg,
 }
 
 std::string MarketNotifier::MonitorStatus() {
-    const AssetConfig* cfg = monitor_running_ ? &kAssets[monitor_asset_index_] : nullptr;
-    return MonitorJson(monitor_running_, cfg, monitor_interval_sec_, "", "");
+    std::vector<size_t> indices;
+    int interval_sec = monitor_interval_sec_;
+    if (monitor_running_) {
+        std::lock_guard<std::mutex> lock(monitor_cfg_mutex_);
+        indices = monitor_assets_;
+        interval_sec = monitor_interval_sec_;
+    }
+    return MonitorJson(monitor_running_, indices, interval_sec, "", nullptr);
 }
 
 std::string MarketNotifier::StartMonitor(const std::string& asset, int interval_sec) {
-    size_t index = 0;
-    std::string error;
-    if (!ResolveAsset(asset, index, error)) {
-        return ErrorJson(error);
+    // "all" (the tool default) monitors every asset at once; anything else
+    // must be a single known asset.
+    std::vector<size_t> indices;
+    std::string key = asset;
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) {
+        return (char)tolower(c);
+    });
+    if (key == "all") {
+        for (size_t i = 0; i < kAssetCount; i++) {
+            indices.push_back(i);
+        }
+    } else {
+        size_t index = 0;
+        std::string error;
+        if (!ResolveAsset(asset, index, error)) {
+            return ErrorJson(error);
+        }
+        indices.push_back(index);
     }
 
     // Keep the request sane; the original script used a fixed 60 s.
     if (interval_sec < 10) interval_sec = 10;
     if (interval_sec > 3600) interval_sec = 3600;
 
-    // Restart cleanly if it was already running for another asset.
+    // Restart cleanly if a monitor was already running.
     StopMonitor();
 
-    // The first cycle runs synchronously so the tool call returns a full
-    // report, exactly like the Python loop which starts with analyze().
-    std::string first_report, cycle_error;
-    RunCycle(&kAssets[index], true, first_report, cycle_error);
-    if (!cycle_error.empty()) {
-        ESP_LOGW(TAG, "Monitor first cycle failed: %s", cycle_error.c_str());
+    // The first cycle of every asset runs synchronously so the tool call
+    // returns full reports, exactly like the Python loop which starts with
+    // analyze(). A failed first cycle does not keep the monitor from starting;
+    // it is reported in `error` and retried on the next round.
+    std::vector<std::string> reports;
+    std::string first_error;
+    for (size_t index : indices) {
+        std::string report, cycle_error;
+        if (RunCycle(&kAssets[index], true, report, cycle_error)) {
+            reports.push_back(std::move(report));
+        } else {
+            ESP_LOGW(TAG, "Monitor first cycle for %s failed: %s",
+                     kAssets[index].key, cycle_error.c_str());
+            if (first_error.empty()) {
+                first_error = cycle_error;
+            }
+        }
     }
 
-    monitor_asset_index_ = index;
-    monitor_interval_sec_ = interval_sec;
+    {
+        std::lock_guard<std::mutex> lock(monitor_cfg_mutex_);
+        monitor_assets_ = indices;
+        monitor_interval_sec_ = interval_sec;
+    }
     monitor_task_alive_ = true;
     monitor_running_ = true;
     if (xTaskCreate(MonitorTaskEntry, "mkt_monitor", 8192, this, 3,
@@ -1191,12 +1236,14 @@ std::string MarketNotifier::StartMonitor(const std::string& asset, int interval_
         monitor_running_ = false;
         monitor_task_alive_ = false;
         monitor_task_handle_ = nullptr;
+        std::lock_guard<std::mutex> lock(monitor_cfg_mutex_);
+        monitor_assets_.clear();
         return ErrorJson("failed to create the monitor task");
     }
 
-    ESP_LOGI(TAG, "Monitor started for %s every %d s",
-             kAssets[index].key, interval_sec);
-    return MonitorJson(true, &kAssets[index], interval_sec, cycle_error, first_report);
+    ESP_LOGI(TAG, "Monitor started for %zu asset(s) every %d s",
+             indices.size(), interval_sec);
+    return MonitorJson(true, indices, interval_sec, first_error, &reports);
 }
 
 std::string MarketNotifier::StopMonitor() {
@@ -1217,6 +1264,10 @@ std::string MarketNotifier::StopMonitor() {
         monitor_task_alive_ = false;
     }
     monitor_task_handle_ = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(monitor_cfg_mutex_);
+        monitor_assets_.clear();
+    }
 
     ESP_LOGI(TAG, "Monitor stopped");
     // Events queued right before the stop still deserve to be spoken.
@@ -1232,15 +1283,26 @@ void MarketNotifier::MonitorTaskEntry(void* arg) {
 }
 
 void MarketNotifier::MonitorTaskLoop() {
-    const AssetConfig* cfg = &kAssets[monitor_asset_index_];
-
     while (monitor_running_) {
-        // Sleep first: StartMonitor() already did the first cycle, and the
+        // The configuration is copied once per round; it only ever changes
+        // while the task is stopped.
+        std::vector<size_t> indices;
+        int interval_sec = 60;
+        {
+            std::lock_guard<std::mutex> lock(monitor_cfg_mutex_);
+            indices = monitor_assets_;
+            interval_sec = monitor_interval_sec_;
+        }
+        if (indices.empty()) {
+            break;
+        }
+
+        // Sleep first: StartMonitor() already did the first rounds, and the
         // period matches the Python time.sleep(INTERVAL). Every second a
         // queued trade announcement gets a chance to be spoken by the
         // assistant, so an event that arrived while the device was busy
         // still goes out during this window.
-        for (int slept = 0; monitor_running_ && slept < monitor_interval_sec_; slept++) {
+        for (int slept = 0; monitor_running_ && slept < interval_sec; slept++) {
             DrainAnnouncements();
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
@@ -1248,10 +1310,20 @@ void MarketNotifier::MonitorTaskLoop() {
             break;
         }
 
-        std::string report, error;
-        if (!RunCycle(cfg, true, report, error)) {
-            // Mirrors the Python loop, which logs the error and keeps going.
-            ESP_LOGE(TAG, "Monitor cycle for %s failed: %s", cfg->key, error.c_str());
+        // One full round: every monitored asset, back to back. The assets
+        // share one interval and one task, so a slow fetch only delays the
+        // other assets by the length of that fetch.
+        for (size_t index : indices) {
+            if (!monitor_running_) {
+                break;
+            }
+            std::string report, error;
+            if (!RunCycle(&kAssets[index], true, report, error)) {
+                // Mirrors the Python loop, which logs the error and keeps going.
+                ESP_LOGE(TAG, "Monitor cycle for %s failed: %s",
+                         kAssets[index].key, error.c_str());
+            }
+            DrainAnnouncements();
         }
     }
 }

@@ -1365,7 +1365,9 @@ public:
         mcp_server.AddTool("self.market.monitor",
             "Start, stop or inspect the background market monitor: a task that keeps "
             "analyzing the market on its own every `interval_sec` seconds, without "
-            "waiting for anyone to ask.\n"
+            "waiting for anyone to ask. By default it watches ALL available assets "
+            "at once (gold, btc, eth, ltc, doge, trump) in one round per interval; "
+            "pass a single `asset` to watch only that one.\n"
             "While it runs the device plays a sound and shows a message on its display "
             "when the trading bot actually opens or closes a position (BUY, "
             "STRONG_BUY, STOP_LOSS, TAKE_PROFIT, SELL, TIME_EXIT). After such a "
@@ -1382,17 +1384,17 @@ public:
             "position state are not, they survive in flash.\n"
             "Args:\n"
             "  `action`: `start` (default), `stop` or `status`.\n"
-            "  `asset`: `gold`, `btc`, `eth`, `ltc`, `doge` or `trump`, used by `start`. "
-            "Defaults to `btc`.\n"
+            "  `asset`: `all` (default), `gold`, `btc`, `eth`, `ltc`, `doge` or "
+            "`trump`, used by `start`.\n"
             "  `interval_sec`: polling period for `start`, 10-3600 seconds, "
             "defaults to 60.\n"
-            "Returns: for `start` the first full analysis report plus a `monitor` "
-            "object; otherwise a `monitor` object with `running`, `asset`, "
-            "`interval_sec`, plus `last_event` and `last_report` of the most "
-            "recent monitor cycle.",
+            "Returns: for `start` a `monitor` object with `assets` and one fresh "
+            "first-cycle analysis report per asset in `reports`; otherwise a "
+            "`monitor` object with `running`, `assets`, `interval_sec`, plus "
+            "`last_event` and `last_report` of the most recent trade.",
             PropertyList({
                 Property("action", kPropertyTypeString, std::string("start")),
-                Property("asset", kPropertyTypeString, std::string("btc")),
+                Property("asset", kPropertyTypeString, std::string("all")),
                 Property("interval_sec", kPropertyTypeInteger, 60, 10, 3600)
             }),
             [this](const PropertyList& properties) -> ReturnValue {
