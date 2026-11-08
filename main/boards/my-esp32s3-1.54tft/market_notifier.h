@@ -32,7 +32,11 @@
  *    instead of ~7200 bars;
  *  - play_signal() beeps on every iteration, which would be constant noise
  *    once the monitor runs unattended. The board stays silent unless the bot
- *    actually opens or closes a position.
+ *    actually opens or closes a position. A trade made by the background
+ *    monitor is then spoken by the assistant: the report (the same JSON a
+ *    manual self.market.analyze returns) is queued and injected as a wake
+ *    word text once the device is idle, so the LLM tells the user what was
+ *    bought or sold and, on an exit, the PnL of the trade.
  */
 class MarketNotifier {
 public:

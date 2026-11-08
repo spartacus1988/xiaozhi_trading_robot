@@ -50,6 +50,15 @@ namespace {
 // two cycles at once, so every cycle takes this lock.
 std::mutex g_cycle_mutex;
 
+// A monitor trade has to be spoken by the assistant, but the assistant can
+// only talk through an open conversation, and a running conversation must not
+// be interrupted by an injected wake word (the server drops the session when
+// it sees a listen.detect mid-dialogue). Events are therefore parked here and
+// handed to Application::WakeWordInvoke() once the device is idle again, see
+// DrainAnnouncements().
+std::mutex g_announce_mutex;
+std::vector<std::string> g_announcements;
+
 // ---------- Settings (from the "НАСТРОЙКИ" block of main.py) ----------
 struct AssetConfig {
     const char* key;      // name used by the tool argument
@@ -565,6 +574,36 @@ BollingerValue Bollinger(const std::vector<double>& values, int period, double m
 
 // ---------- 4. Signal ----------
 
+// Escapes a string so it survives being embedded in the JSON wake word
+// message: Protocol::SendWakeWordDetected() builds that message by plain
+// string concatenation, so an unescaped quote would break it.
+std::string EscapeForJson(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (char c : text) {
+        if (c == '"' || c == '\\') {
+            out += '\\';
+            out += c;
+        } else if (c == '\n' || c == '\r') {
+            out += ' ';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// Parks a spoken announcement until the device can hand it to the assistant.
+void EnqueueAnnouncement(std::string text) {
+    std::lock_guard<std::mutex> lock(g_announce_mutex);
+    if (g_announcements.size() >= 4) {
+        // Unattended trading must not build an unbounded backlog; the oldest
+        // event is the least relevant one anyway.
+        g_announcements.erase(g_announcements.begin());
+    }
+    g_announcements.push_back(std::move(text));
+}
+
 // The Python script plays a beep on *every* iteration, scaled by |score|
 // (play_signal). That was fine for a console script, but the device now runs
 // the same loop unattended every minute, so a beep per iteration would be
@@ -573,12 +612,18 @@ BollingerValue Bollinger(const std::vector<double>& values, int period, double m
 // STOP_LOSS, TAKE_PROFIT, SELL and TIME_EXIT announce themselves, while HOLD
 // and WAIT announce nothing at all.
 //
-// The message is shown on the display and written to the log. Speech is not
-// available here: the device has no local TTS, everything spoken by the
-// assistant comes from the server over MQTT.
+// What happens on a real trade depends on where the cycle came from:
+//  - a direct self.market.analyze call: the assistant reads the report aloud
+//    as soon as the tool returns, so the trade only needs the local popup and
+//    the confirmation beep;
+//  - the background monitor: the assistant is not in a dialogue, so the beep
+//    is dropped (the popup stays) and the whole report - the same JSON the
+//    assistant reads after a manual analysis - is queued for the assistant to
+//    speak, together with the action taken and, on an exit, the PnL of the
+//    closed trade. See EnqueueAnnouncement()/DrainAnnouncements().
 void NotifyTrade(const AssetConfig* cfg, const char* action, int score,
                  double price, double pnl_pct, double pnl_usd, double hold_min,
-                 const BotState& state) {
+                 const BotState& state, bool announce, const std::string& report) {
     const bool is_entry = strcmp(action, "BUY") == 0 || strcmp(action, "STRONG_BUY") == 0;
     const bool is_exit  = strcmp(action, "STOP_LOSS") == 0 || strcmp(action, "TAKE_PROFIT") == 0 ||
                           strcmp(action, "SELL") == 0 || strcmp(action, "TIME_EXIT") == 0;
@@ -606,11 +651,88 @@ void NotifyTrade(const AssetConfig* cfg, const char* action, int score,
     }
 
     auto& app = Application::GetInstance();
-    if (is_entry) {
-        app.Alert("Market", message, "happy", Lang::Sounds::OGG_SUCCESS);
-    } else {
-        app.Alert("Market", message, "angry", Lang::Sounds::OGG_EXCLAMATION);
+    const char* emotion = is_entry ? "happy" : "angry";
+
+    if (!announce) {
+        app.Alert("Market", message, emotion,
+                  is_entry ? Lang::Sounds::OGG_SUCCESS : Lang::Sounds::OGG_EXCLAMATION);
+        return;
     }
+
+    // Background monitor: no beep, the popup stays on the display, and the
+    // report is queued so that the assistant speaks it instead.
+    app.Alert("Market", message, emotion, "");
+
+    char price_str[32];
+    snprintf(price_str, sizeof(price_str), "%.*f", cfg->decimals, price);
+
+    std::string text = "Торговый бот: ";
+    if (is_entry) {
+        text += strcmp(action, "STRONG_BUY") == 0 ? "СИЛЬНАЯ ПОКУПКА (" : "ПОКУПКА (";
+        text += action;
+        text += ") — ";
+        text += cfg->name;
+        text += ", цена ";
+        text += price_str;
+        text += " USD.";
+    } else {
+        text += "ПРОДАЖА";
+        if (strcmp(action, "STOP_LOSS") == 0) {
+            text += " по стоп-лоссу";
+        } else if (strcmp(action, "TAKE_PROFIT") == 0) {
+            text += " по тейк-профиту";
+        } else if (strcmp(action, "SELL") == 0) {
+            text += " по сигналу";
+        } else {
+            text += " по времени";
+        }
+        text += " (";
+        text += action;
+        text += ") — ";
+        text += cfg->name;
+        char pnl[96];
+        snprintf(pnl, sizeof(pnl), ", результат: %s %.2f USD (%+.2f%%).",
+                 pnl_usd >= 0.0 ? "прибыль" : "убыток", pnl_usd, pnl_pct);
+        text += pnl;
+    }
+
+    // The full analysis report: exactly the JSON the assistant reads after a
+    // manual self.market.analyze call, so the spoken wording stays the same.
+    text += " Отчёт анализа: ";
+    text += report;
+    text += ". Ответь пользователю голосом: назови действие, зачитай полный отчёт анализа и результат сделки.";
+
+    EnqueueAnnouncement(std::move(text));
+}
+
+// Hands the oldest parked announcement to the assistant, but only while the
+// device is idle: injecting a wake word into a running conversation would be
+// dropped or would close the server session. Runs once a second from the
+// monitor sleep loop and again when the monitor stops, so an event that
+// arrived while the device was busy goes out at the next idle window.
+void DrainAnnouncements() {
+    std::string text;
+    {
+        std::lock_guard<std::mutex> lock(g_announce_mutex);
+        if (g_announcements.empty()) {
+            return;
+        }
+        text = g_announcements.front();
+        g_announcements.erase(g_announcements.begin());
+    }
+
+    Application::GetInstance().Schedule([text]() {
+        auto& app = Application::GetInstance();
+        if (app.GetDeviceState() != kDeviceStateIdle) {
+            // The device picked up a conversation since the check: keep the
+            // announcement and retry on the next drain instead of cutting in.
+            std::lock_guard<std::mutex> lock(g_announce_mutex);
+            g_announcements.insert(g_announcements.begin(), text);
+            return;
+        }
+        ESP_LOGI(TAG, "Asking the assistant to speak the queued market event");
+        app.WakeWordInvoke(EscapeForJson(text));
+    });
 }
 
 // ---------- 5. Bot logic ----------
@@ -755,8 +877,11 @@ namespace {
 // One full iteration of the Python loop: download candles, score them, let the
 // trading bot act on that score, persist the new state, announce a real trade
 // and build the report. Both self.market.analyze and the monitor task run this
-// same function, so the two paths can never drift apart.
-bool RunCycle(const AssetConfig* cfg, std::string& report, std::string& error) {
+// same function, so the two paths can never drift apart. `announce` tells
+// NotifyTrade() whether this cycle came from the background monitor (the
+// assistant must speak the event) or from a tool call (it speaks anyway).
+bool RunCycle(const AssetConfig* cfg, bool announce,
+              std::string& report, std::string& error) {
     // The tool and the monitor task can overlap in time; the NVS state is a
     // read-modify-write and must not be interleaved.
     std::lock_guard<std::mutex> cycle_lock(g_cycle_mutex);
@@ -953,7 +1078,8 @@ bool RunCycle(const AssetConfig* cfg, std::string& report, std::string& error) {
     ESP_LOGI(TAG, "%s (%s) price %.*f, score %+d, action %s",
              cfg->name, ticker_used.c_str(), dec, price, score, action);
 
-    NotifyTrade(cfg, action, score, price, pnl_pct, pnl_usd, hold_time_min, state);
+    NotifyTrade(cfg, action, score, price, pnl_pct, pnl_usd, hold_time_min,
+                state, announce, result);
 
     report = std::move(result);
     return true;
@@ -996,7 +1122,7 @@ std::string MarketNotifier::Analyze(const std::string& asset) {
     }
 
     std::string report, cycle_error;
-    if (!RunCycle(&kAssets[index], report, cycle_error)) {
+    if (!RunCycle(&kAssets[index], false, report, cycle_error)) {
         return ErrorJson(cycle_error);
     }
     return report;
@@ -1058,7 +1184,7 @@ std::string MarketNotifier::StartMonitor(const std::string& asset, int interval_
     // The first cycle runs synchronously so the tool call returns a full
     // report, exactly like the Python loop which starts with analyze().
     std::string first_report, cycle_error;
-    RunCycle(&kAssets[index], first_report, cycle_error);
+    RunCycle(&kAssets[index], true, first_report, cycle_error);
     if (!cycle_error.empty()) {
         ESP_LOGW(TAG, "Monitor first cycle failed: %s", cycle_error.c_str());
     }
@@ -1100,6 +1226,8 @@ std::string MarketNotifier::StopMonitor() {
     monitor_task_handle_ = nullptr;
 
     ESP_LOGI(TAG, "Monitor stopped");
+    // Events queued right before the stop still deserve to be spoken.
+    DrainAnnouncements();
     return MonitorStatus();
 }
 
@@ -1115,8 +1243,12 @@ void MarketNotifier::MonitorTaskLoop() {
 
     while (monitor_running_) {
         // Sleep first: StartMonitor() already did the first cycle, and the
-        // period matches the Python time.sleep(INTERVAL).
+        // period matches the Python time.sleep(INTERVAL). Every second a
+        // queued trade announcement gets a chance to be spoken by the
+        // assistant, so an event that arrived while the device was busy
+        // still goes out during this window.
         for (int slept = 0; monitor_running_ && slept < monitor_interval_sec_; slept++) {
+            DrainAnnouncements();
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
         if (!monitor_running_) {
@@ -1124,7 +1256,7 @@ void MarketNotifier::MonitorTaskLoop() {
         }
 
         std::string report, error;
-        if (!RunCycle(cfg, report, error)) {
+        if (!RunCycle(cfg, true, report, error)) {
             // Mirrors the Python loop, which logs the error and keeps going.
             ESP_LOGE(TAG, "Monitor cycle for %s failed: %s", cfg->key, error.c_str());
         }
