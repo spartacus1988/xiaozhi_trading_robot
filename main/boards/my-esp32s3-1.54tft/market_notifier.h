@@ -37,11 +37,10 @@
  *    once the monitor runs unattended. The board stays silent unless the bot
  *    actually opens or closes a position: the beep and the popup stay as
  *    before, and a trade made by the background monitor additionally wakes
- *    the assistant with a short signal ("торговый бот: покупка" /
- *    "торговый бот: продажа"). On that signal the assistant calls
- *    self.market.monitor with action=status and reads the result aloud -
- *    last_event (action and PnL) and last_report (the full analysis report,
- *    the same JSON a manual self.market.analyze returns).
+ *    the assistant with a short signal ("buy" / "sell"). On that signal the
+ *    assistant calls self.market.monitor with action=status and reads the
+ *    result aloud - last_event (action and PnL) and last_report (the full
+ *    analysis report, the same JSON a manual self.market.analyze returns).
  */
 class MarketNotifier {
 public:

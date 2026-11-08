@@ -1372,7 +1372,7 @@ public:
             "when the trading bot actually opens or closes a position (BUY, "
             "STRONG_BUY, STOP_LOSS, TAKE_PROFIT, SELL, TIME_EXIT). After such a "
             "trade the device also speaks a SHORT signal of its own, like "
-            "`торговый бот: покупка` or `торговый бот: продажа`. Treat that "
+            "`buy` or `sell`. Treat that "
             "signal as a trigger: call this tool with `action`: `status` and "
             "read the result aloud to the user - `last_event` says what was "
             "bought or sold (with the profit or loss on a sale) and "

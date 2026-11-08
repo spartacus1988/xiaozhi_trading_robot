@@ -14,6 +14,7 @@
 #include <vector>
 #include <functional>
 #include <mutex>
+#include <atomic>
 #include <condition_variable>
 
 #include "audio_codec.h"
@@ -54,6 +55,10 @@ private:
     std::deque<std::vector<uint8_t>> wake_word_opus_;
     std::mutex wake_word_mutex_;
     std::condition_variable wake_word_cv_;
+    // Set while the static encode task runs: a second EncodeWakeWordData()
+    // during that window would overwrite the task handle and race on the
+    // pcm/opus deques, so the second call is skipped instead.
+    std::atomic<bool> wake_word_encoding_{false};
 
     void StoreWakeWordData(const int16_t* data, size_t size);
     void AudioDetectionTask();

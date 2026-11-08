@@ -162,6 +162,9 @@ void AfeWakeWord::AudioDetectionTask() {
 
 void AfeWakeWord::StoreWakeWordData(const int16_t* data, size_t samples) {
     // store audio data to wake_word_pcm_
+    // Guarded by wake_word_mutex_: the encode task swaps this deque out from
+    // under us, and iterating it while this task appends crashed the encoder.
+    std::lock_guard<std::mutex> lock(wake_word_mutex_);
     wake_word_pcm_.emplace_back(std::vector<int16_t>(data, data + samples));
     // keep about 2 seconds of data, detect duration is 30ms (sample_rate == 16000, chunksize == 512)
     while (wake_word_pcm_.size() > 2000 / 30) {
@@ -171,7 +174,18 @@ void AfeWakeWord::StoreWakeWordData(const int16_t* data, size_t samples) {
 
 void AfeWakeWord::EncodeWakeWordData() {
     const size_t stack_size = 4096 * 6;
-    wake_word_opus_.clear();
+    // Only one encoder at a time. A second call while the first is still
+    // running would overwrite the static task handle and race on the pcm and
+    // opus deques; the in-flight encode still delivers its packets, so the
+    // skipped call is safe (PopWakeWordPacket() will pick those up).
+    if (wake_word_encoding_.exchange(true)) {
+        ESP_LOGW(TAG, "Wake word encoding already in progress, skipping");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(wake_word_mutex_);
+        wake_word_opus_.clear();
+    }
     if (wake_word_encode_task_stack_ == nullptr) {
         wake_word_encode_task_stack_ = (StackType_t*)heap_caps_malloc(stack_size, MALLOC_CAP_SPIRAM);
         assert(wake_word_encode_task_stack_ != nullptr);
@@ -183,6 +197,15 @@ void AfeWakeWord::EncodeWakeWordData() {
 
     wake_word_encode_task_ = xTaskCreateStatic([](void* arg) {
         auto this_ = (AfeWakeWord*)arg;
+        // Take the PCM buffer out under the lock before encoding: the AFE
+        // task appends to it every 30 ms (StoreWakeWordData), and iterating
+        // it unlocked crashed the encoder with a use-after-free inside
+        // vector::insert (Guru Meditation on the second synthetic invoke).
+        std::deque<std::vector<int16_t>> pcm;
+        {
+            std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
+            pcm.swap(this_->wake_word_pcm_);
+        }
         {
             auto start_time = esp_timer_get_time();
             // Create encoder
@@ -191,9 +214,13 @@ void AfeWakeWord::EncodeWakeWordData() {
             auto ret = esp_opus_enc_open(&opus_enc_cfg, sizeof(esp_opus_enc_config_t), &encoder_handle);
             if (encoder_handle == nullptr) {
                 ESP_LOGE(TAG, "Failed to create audio encoder, error code: %d", ret);
-                std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
-                this_->wake_word_opus_.push_back(std::vector<uint8_t>());
-                this_->wake_word_cv_.notify_all();
+                {
+                    std::lock_guard<std::mutex> lock(this_->wake_word_mutex_);
+                    this_->wake_word_opus_.push_back(std::vector<uint8_t>());
+                    this_->wake_word_cv_.notify_all();
+                }
+                this_->wake_word_encoding_ = false;
+                vTaskDelete(NULL);
                 return;
             }
             
@@ -209,12 +236,12 @@ void AfeWakeWord::EncodeWakeWordData() {
             esp_audio_enc_in_frame_t in = {};
             esp_audio_enc_out_frame_t out = {};
             
-            for (auto& pcm: this_->wake_word_pcm_) {
+            for (auto& chunk : pcm) {
                 if (in_buffer.empty()) {
-                    in_buffer = std::move(pcm);
+                    in_buffer = std::move(chunk);
                 } else {
-                    in_buffer.reserve(in_buffer.size() + pcm.size());
-                    in_buffer.insert(in_buffer.end(), pcm.begin(), pcm.end());
+                    in_buffer.reserve(in_buffer.size() + chunk.size());
+                    in_buffer.insert(in_buffer.end(), chunk.begin(), chunk.end());
                 }
                 
                 while (in_buffer.size() >= frame_size) {
@@ -238,7 +265,6 @@ void AfeWakeWord::EncodeWakeWordData() {
                     in_buffer.erase(in_buffer.begin(), in_buffer.begin() + frame_size);
                 }
             }
-            this_->wake_word_pcm_.clear();
             // Close encoder
             esp_opus_enc_close(encoder_handle);
             auto end_time = esp_timer_get_time();
@@ -248,6 +274,9 @@ void AfeWakeWord::EncodeWakeWordData() {
             this_->wake_word_opus_.push_back(std::vector<uint8_t>());
             this_->wake_word_cv_.notify_all();
         }
+        // Released after the terminator is queued so a following encode can
+        // never clear the opus deque before this one finished feeding it.
+        this_->wake_word_encoding_ = false;
         vTaskDelete(NULL);
     }, "encode_wake_word", stack_size, this, 2, wake_word_encode_task_stack_, wake_word_encode_task_buffer_);
 }

@@ -601,7 +601,7 @@ std::string EscapeForJson(const std::string& text) {
 // Parks a spoken announcement until the device can hand it to the assistant.
 void EnqueueAnnouncement(std::string text) {
     std::lock_guard<std::mutex> lock(g_announce_mutex);
-    if (g_announcements.size() >= 4) {
+    if (g_announcements.size() >= 8) {
         // Unattended trading must not build an unbounded backlog; the oldest
         // event is the least relevant one anyway.
         g_announcements.erase(g_announcements.begin());
@@ -620,9 +620,9 @@ void EnqueueAnnouncement(std::string text) {
 // What happens on a real trade:
 //  - the popup and the beep stay exactly as they were, in both paths;
 //  - a cycle from the background monitor additionally wakes the assistant
-//    with a *short* signal ("торговый бот: покупка"). The server rejects
-//    anything longer in a listen.detect ("Detect is only for wake word, do
-//    not send long text"), so the full report travels the other way round:
+//    with a *short* signal ("buy" / "sell"). The official server rejects
+//    anything long in a listen.detect ("Detect is only for wake words, do
+//    not send long texts"), so the full report travels the other way round:
 //    on that signal the assistant calls self.market.monitor with
 //    action=status and reads the last_report it returns, exactly like it
 //    reads the result of a manual self.market.analyze call.
@@ -665,12 +665,15 @@ bool NotifyTrade(const AssetConfig* cfg, const char* action, int score,
 
     if (announce) {
         // Remember what the trade was for the monitor status payload, and
-        // queue the short wake word signal for the assistant.
+        // queue the short wake word signal for the assistant. The official
+        // xiaozhi.me server rejects anything long in a listen.detect
+        // ("Detect is only for wake words, do not send long texts"), so the
+        // signal is a single short ASCII word.
         {
             std::lock_guard<std::mutex> lock(g_announce_mutex);
             g_last_event = message;
         }
-        EnqueueAnnouncement(is_entry ? "торговый бот: покупка" : "торговый бот: продажа");
+        EnqueueAnnouncement(is_entry ? "buy" : "sell");
     }
     return true;
 }
@@ -700,7 +703,8 @@ void DrainAnnouncements() {
             g_announcements.insert(g_announcements.begin(), text);
             return;
         }
-        ESP_LOGI(TAG, "Asking the assistant to speak the queued market event");
+        ESP_LOGI(TAG, "Asking the assistant to speak the queued market event: '%s' (%u bytes)",
+                 text.c_str(), (unsigned)text.size());
         app.WakeWordInvoke(EscapeForJson(text));
     });
 }
@@ -1241,8 +1245,8 @@ std::string MarketNotifier::StartMonitor(const std::string& asset, int interval_
         return ErrorJson("failed to create the monitor task");
     }
 
-    ESP_LOGI(TAG, "Monitor started for %zu asset(s) every %d s",
-             indices.size(), interval_sec);
+    ESP_LOGI(TAG, "Monitor started for %u asset(s) every %d s",
+             (unsigned)indices.size(), interval_sec);
     return MonitorJson(true, indices, interval_sec, first_error, &reports);
 }
 
