@@ -46,7 +46,8 @@ public:
      * @brief Fetch fresh candles, compute indicators, run the trading bot
      *        for one cycle and persist its state.
      *
-     * @param asset "gold" or "btc" (case-insensitive).
+     * @param asset One of "gold", "btc", "eth", "ltc", "doge" or "trump"
+     *              (case-insensitive).
      * @return The MCP tool payload as a JSON string. On failure it is an
      *         object with a single "error" key.
      */
@@ -58,7 +59,8 @@ public:
      * The first cycle runs synchronously so the caller immediately gets a
      * full report back; every following cycle runs in the background task.
      *
-     * @param asset "gold" or "btc" (case-insensitive).
+     * @param asset One of "gold", "btc", "eth", "ltc", "doge" or "trump"
+     *              (case-insensitive).
      * @param interval_sec polling period, clamped to [10, 3600] seconds.
      * @return JSON with the monitor state merged into the first report.
      */

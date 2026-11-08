@@ -52,20 +52,35 @@ std::mutex g_cycle_mutex;
 
 // ---------- Settings (from the "НАСТРОЙКИ" block of main.py) ----------
 struct AssetConfig {
-    const char* key;     // name used by the tool argument
-    const char* ticker;  // Yahoo symbol
-    const char* name;    // human readable name
-    const char* range;   // Yahoo range
-    const char* interval;// Yahoo interval
+    const char* key;      // name used by the tool argument
+    // Yahoo symbols tried in order until one answers with usable candles,
+    // nullptr-terminated. More than one entry only where Yahoo has been
+    // known to re-symbolise a listing (see the trump row below).
+    const char* tickers[4];
+    const char* name;     // human readable name
+    const char* range;    // Yahoo range
+    const char* interval; // Yahoo interval
     int decimals;
 };
 
 // The original script used range=5d/interval=1m for gold. On the device that
 // is ~7200 bars and a multi-megabyte cJSON tree, so gold is requested with
 // 5 minute candles over the same 5 day window (~1440 bars).
+// The crypto rows reuse the bitcoin request (1 day of 1 minute bars, ~1440):
+// they trade around the clock, so a day window is a full session for them.
+//
+// Yahoo has re-symbolised the Official Trump listing at least once: the
+// symbol has appeared as TRUMP-USD, OFFICIAL-TRUMP-USD and TRUMP35336-USD
+// over time, and a stale one answers "no data" or 404s. All three are tried
+// in order so the asset keeps working whichever symbol Yahoo currently uses.
 const AssetConfig kAssets[] = {
-    {"gold", "GC=F",    "Золото (фьючерс)", "5d", "5m", 2},
-    {"btc",  "BTC-USD", "Bitcoin",          "1d", "1m", 2},
+    {"gold",  {"GC=F"},        "Золото (фьючерс)", "5d", "5m", 2},
+    {"btc",   {"BTC-USD"},     "Bitcoin",          "1d", "1m", 2},
+    {"eth",   {"ETH-USD"},     "Ethereum",         "1d", "1m", 2},
+    {"ltc",   {"LTC-USD"},     "Litecoin",         "1d", "1m", 2},
+    {"doge",  {"DOGE-USD"},    "Dogecoin",         "1d", "1m", 5},
+    {"trump", {"TRUMP-USD", "OFFICIAL-TRUMP-USD", "TRUMP35336-USD"},
+               "Official Trump", "1d", "1m", 4},
 };
 constexpr size_t kAssetCount = sizeof(kAssets) / sizeof(kAssets[0]);
 
@@ -164,11 +179,15 @@ const char* kYahooHosts[] = {
 };
 constexpr size_t kYahooHostCount = sizeof(kYahooHosts) / sizeof(kYahooHosts[0]);
 
+// Downloads candles for the first Yahoo symbol of `cfg` that answers with
+// usable data, writing that symbol to `ticker_used` so the report can name
+// the listing the data actually came from.
 bool FetchOhlcv(const AssetConfig& cfg,
                 std::vector<double>& highs,
                 std::vector<double>& lows,
                 std::vector<double>& closes,
                 std::vector<double>& volumes,
+                std::string& ticker_used,
                 std::string& error) {
     auto network = Board::GetInstance().GetNetwork();
     if (network == nullptr) {
@@ -176,138 +195,163 @@ bool FetchOhlcv(const AssetConfig& cfg,
         return false;
     }
 
-    std::string body;
-    bool opened = false;
+    std::string last_error;
 
-    for (size_t attempt = 0; attempt < kYahooHostCount; ++attempt) {
-        const char* host = kYahooHosts[attempt];
+    // Outer loop: the candidate symbols of one asset. A symbol Yahoo no
+    // longer knows (404, empty chart, unusable candles) just moves the fetch
+    // to the next one; only a rate limit aborts right away.
+    for (size_t t = 0; cfg.tickers[t] != nullptr; ++t) {
+        const char* ticker = cfg.tickers[t];
+        std::string body;
+        bool have_body = false;
 
-        // A host whose whole address pool is already known not to answer TLS
-        // would only burn the connect timeout; the fallback host gets a chance
-        // instead and the pool is refreshed in the background anyway.
-        if (!DohHostIsUsable(host)) {
-            ESP_LOGW(TAG, "Skipping %s: every address it resolves to is marked bad", host);
-            continue;
-        }
+        for (size_t attempt = 0; attempt < kYahooHostCount; ++attempt) {
+            const char* host = kYahooHosts[attempt];
 
-        const std::string url = std::string("https://") + host + "/v8/finance/chart/" +
-                                cfg.ticker + "?interval=" + cfg.interval + "&range=" + cfg.range;
+            // A host whose whole address pool is already known not to answer TLS
+            // would only burn the connect timeout; the fallback host gets a chance
+            // instead and the pool is refreshed in the background anyway.
+            if (!DohHostIsUsable(host)) {
+                ESP_LOGW(TAG, "Skipping %s: every address it resolves to is marked bad", host);
+                continue;
+            }
 
-        auto http = network->CreateHttp(0);
-        // NOTE: with this client the timeout is a per-read wait, not a whole-body
-        // budget, so 30 s of silence between two chunks is already generous.
-        http->SetTimeout(30000);
-        http->SetHeader("User-Agent", "Mozilla/5.0");
+            const std::string url = std::string("https://") + host + "/v8/finance/chart/" +
+                                    ticker + "?interval=" + cfg.interval + "&range=" + cfg.range;
 
-        if (!http->Open("GET", url)) {
-            // The address the DNS hook served for this host is the one
-            // esp-tls tried and gave up on; telling the DoH cache about it
-            // stops it from being offered again for the next half hour.
-            DohNoteConnectFailure(host);
-            ESP_LOGW(TAG, "Open failed on %s, %s", host,
-                     attempt + 1 < kYahooHostCount ? "trying the fallback host"
-                                                   : "no hosts left");
-            continue;
-        }
-        opened = true;
+            auto http = network->CreateHttp(0);
+            // NOTE: with this client the timeout is a per-read wait, not a whole-body
+            // budget, so 30 s of silence between two chunks is already generous.
+            http->SetTimeout(30000);
+            http->SetHeader("User-Agent", "Mozilla/5.0");
 
-        int status_code = http->GetStatusCode();
-        if (status_code == 429) {
-            http->Close();
-            error = "Yahoo Finance rate limit (HTTP 429), try again later";
-            return false;
-        }
-        if (status_code != 200) {
-            http->Close();
-            error = "Yahoo Finance replied with HTTP " + std::to_string(status_code);
-            return false;
-        }
+            if (!http->Open("GET", url)) {
+                // The address the DNS hook served for this host is the one
+                // esp-tls tried and gave up on; telling the DoH cache about it
+                // stops it from being offered again for the next half hour.
+                DohNoteConnectFailure(host);
+                ESP_LOGW(TAG, "Open failed on %s, %s", host,
+                         attempt + 1 < kYahooHostCount ? "trying the fallback host"
+                                                       : "no hosts left");
+                continue;
+            }
 
-        // Read the body in chunks instead of ReadAll().
-        //
-        // Http::ReadAll() waits for eof_ without ever draining body_chunks_,
-        // while the receive path blocks itself once 8 kB are buffered there
-        // (MAX_BODY_CHUNKS_SIZE in http_client.cc) and is only released by a
-        // Read() or a Close(). Any response larger than 8 kB therefore
-        // deadlocks and ReadAll() times out and returns an empty string, which
-        // then looks like a JSON parse error. Both Yahoo payloads are way
-        // above that limit (BTC ~35 kB, gold ~80 kB), so streaming them is
-        // mandatory.
-        char buffer[1536];
-        while (true) {
-            int bytes_read = http->Read(buffer, sizeof(buffer));
-            if (bytes_read < 0) {
+            int status_code = http->GetStatusCode();
+            if (status_code == 429) {
                 http->Close();
-                error = "connection to Yahoo Finance was reset while downloading";
+                error = "Yahoo Finance rate limit (HTTP 429), try again later";
                 return false;
             }
-            if (bytes_read == 0) {
-                break;  // end of body
+            if (status_code != 200) {
+                http->Close();
+                last_error = "Yahoo Finance replied with HTTP " + std::to_string(status_code) +
+                             " for ticker " + ticker;
+                ESP_LOGW(TAG, "%s on %s, %s", last_error.c_str(), host,
+                         attempt + 1 < kYahooHostCount ? "trying the fallback host"
+                                                       : "no hosts left");
+                continue;
             }
-            body.append(buffer, static_cast<size_t>(bytes_read));
+
+            // Read the body in chunks instead of ReadAll().
+            //
+            // Http::ReadAll() waits for eof_ without ever draining body_chunks_,
+            // while the receive path blocks itself once 8 kB are buffered there
+            // (MAX_BODY_CHUNKS_SIZE in http_client.cc) and is only released by a
+            // Read() or a Close(). Any response larger than 8 kB therefore
+            // deadlocks and ReadAll() times out and returns an empty string, which
+            // then looks like a JSON parse error. Both Yahoo payloads are way
+            // above that limit (BTC ~35 kB, gold ~80 kB), so streaming them is
+            // mandatory.
+            char buffer[1536];
+            bool read_failed = false;
+            while (true) {
+                int bytes_read = http->Read(buffer, sizeof(buffer));
+                if (bytes_read < 0) {
+                    last_error = "connection to Yahoo Finance was reset while downloading";
+                    read_failed = true;
+                    break;
+                }
+                if (bytes_read == 0) {
+                    break;  // end of body
+                }
+                body.append(buffer, static_cast<size_t>(bytes_read));
+            }
+            http->Close();
+            if (read_failed) {
+                ESP_LOGW(TAG, "%s (%s, %s)", last_error.c_str(), ticker, host);
+                body.clear();
+                continue;
+            }
+
+            ESP_LOGI(TAG, "Downloaded %u bytes from %s for %s",
+                     static_cast<unsigned>(body.size()), host, ticker);
+            have_body = true;
+            break;  // complete body received, no need for the fallback host
         }
-        http->Close();
 
-        ESP_LOGI(TAG, "Downloaded %u bytes from %s for %s",
-                 static_cast<unsigned>(body.size()), host, cfg.ticker);
-        break;  // complete body received, no need for the fallback host
-    }
+        if (!have_body) {
+            // Every host failed for this symbol: remember why, try the next one.
+            continue;
+        }
 
-    if (!opened) {
-        error = "failed to open a connection to Yahoo Finance";
-        return false;
-    }
+        cJSON* root = cJSON_Parse(body.c_str());
+        if (root == nullptr) {
+            last_error = "failed to parse the Yahoo Finance response for ticker " + std::string(ticker);
+            continue;
+        }
 
-    cJSON* root = cJSON_Parse(body.c_str());
-    if (root == nullptr) {
-        error = "failed to parse the Yahoo Finance response";
-        return false;
-    }
+        cJSON* results = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "chart"), "result");
+        cJSON* first = cJSON_GetArrayItem(results, 0);
+        if (first == nullptr) {
+            cJSON_Delete(root);
+            last_error = "no data returned for ticker " + std::string(ticker);
+            ESP_LOGW(TAG, "%s, trying the next symbol", last_error.c_str());
+            continue;
+        }
 
-    cJSON* results = cJSON_GetObjectItem(cJSON_GetObjectItem(root, "chart"), "result");
-    cJSON* first = cJSON_GetArrayItem(results, 0);
-    if (first == nullptr) {
+        cJSON* quote = cJSON_GetArrayItem(cJSON_GetObjectItem(cJSON_GetObjectItem(first, "indicators"), "quote"), 0);
+        cJSON* h_arr = quote ? cJSON_GetObjectItem(quote, "high") : nullptr;
+        cJSON* l_arr = quote ? cJSON_GetObjectItem(quote, "low") : nullptr;
+        cJSON* c_arr = quote ? cJSON_GetObjectItem(quote, "close") : nullptr;
+        cJSON* v_arr = quote ? cJSON_GetObjectItem(quote, "volume") : nullptr;
+
+        if (h_arr == nullptr || l_arr == nullptr || c_arr == nullptr || v_arr == nullptr) {
+            cJSON_Delete(root);
+            last_error = "incomplete candle data for ticker " + std::string(ticker);
+            continue;
+        }
+
+        int n = cJSON_GetArraySize(h_arr);
+        for (int i = 0; i < n; i++) {
+            cJSON* h = cJSON_GetArrayItem(h_arr, i);
+            cJSON* l = cJSON_GetArrayItem(l_arr, i);
+            cJSON* c = cJSON_GetArrayItem(c_arr, i);
+            cJSON* v = cJSON_GetArrayItem(v_arr, i);
+
+            double volume = (v != nullptr && cJSON_IsNumber(v)) ? v->valuedouble : 0.0;
+            if (h == nullptr || l == nullptr || c == nullptr) continue;
+            if (!cJSON_IsNumber(h) || !cJSON_IsNumber(l) || !cJSON_IsNumber(c)) continue;
+
+            highs.push_back(h->valuedouble);
+            lows.push_back(l->valuedouble);
+            closes.push_back(c->valuedouble);
+            volumes.push_back(volume);
+        }
         cJSON_Delete(root);
-        error = "no data returned for ticker " + std::string(cfg.ticker);
-        return false;
+
+        if (closes.empty()) {
+            last_error = "no usable candles for ticker " + std::string(ticker);
+            continue;
+        }
+
+        ticker_used = ticker;
+        return true;
     }
 
-    cJSON* quote = cJSON_GetArrayItem(cJSON_GetObjectItem(cJSON_GetObjectItem(first, "indicators"), "quote"), 0);
-    cJSON* h_arr = quote ? cJSON_GetObjectItem(quote, "high") : nullptr;
-    cJSON* l_arr = quote ? cJSON_GetObjectItem(quote, "low") : nullptr;
-    cJSON* c_arr = quote ? cJSON_GetObjectItem(quote, "close") : nullptr;
-    cJSON* v_arr = quote ? cJSON_GetObjectItem(quote, "volume") : nullptr;
-
-    if (h_arr == nullptr || l_arr == nullptr || c_arr == nullptr || v_arr == nullptr) {
-        cJSON_Delete(root);
-        error = "incomplete candle data for ticker " + std::string(cfg.ticker);
-        return false;
-    }
-
-    int n = cJSON_GetArraySize(h_arr);
-    for (int i = 0; i < n; i++) {
-        cJSON* h = cJSON_GetArrayItem(h_arr, i);
-        cJSON* l = cJSON_GetArrayItem(l_arr, i);
-        cJSON* c = cJSON_GetArrayItem(c_arr, i);
-        cJSON* v = cJSON_GetArrayItem(v_arr, i);
-
-        double volume = (v != nullptr && cJSON_IsNumber(v)) ? v->valuedouble : 0.0;
-        if (h == nullptr || l == nullptr || c == nullptr) continue;
-        if (!cJSON_IsNumber(h) || !cJSON_IsNumber(l) || !cJSON_IsNumber(c)) continue;
-
-        highs.push_back(h->valuedouble);
-        lows.push_back(l->valuedouble);
-        closes.push_back(c->valuedouble);
-        volumes.push_back(volume);
-    }
-
-    cJSON_Delete(root);
-
-    if (closes.empty()) {
-        error = "no usable candles for ticker " + std::string(cfg.ticker);
-        return false;
-    }
-    return true;
+    // Nothing answered: either every open failed, or every symbol came back
+    // empty; report whichever of the two actually happened.
+    error = last_error.empty() ? "failed to open a connection to Yahoo Finance" : last_error;
+    return false;
 }
 
 // ---------- 3. Indicators ----------
@@ -718,8 +762,8 @@ bool RunCycle(const AssetConfig* cfg, std::string& report, std::string& error) {
     std::lock_guard<std::mutex> cycle_lock(g_cycle_mutex);
 
     std::vector<double> highs, lows, closes, volumes;
-    std::string fetch_error;
-    if (!FetchOhlcv(*cfg, highs, lows, closes, volumes, fetch_error)) {
+    std::string fetch_error, ticker_used;
+    if (!FetchOhlcv(*cfg, highs, lows, closes, volumes, ticker_used, fetch_error)) {
         ESP_LOGE(TAG, "Fetch failed: %s", fetch_error.c_str());
         error = fetch_error;
         return false;
@@ -729,8 +773,8 @@ bool RunCycle(const AssetConfig* cfg, std::string& report, std::string& error) {
     // MACD (MACD_SLOW + MACD_SIGNAL bars).
     if (closes.size() < (size_t)(kMacdSlow + kMacdSignal)) {
         ESP_LOGW(TAG, "Only %d candles for %s, not enough for the analysis",
-                 (int)closes.size(), cfg->ticker);
-        error = "not enough candles for ticker " + std::string(cfg->ticker);
+                 (int)closes.size(), ticker_used.c_str());
+        error = "not enough candles for ticker " + ticker_used;
         return false;
     }
 
@@ -803,7 +847,7 @@ bool RunCycle(const AssetConfig* cfg, std::string& report, std::string& error) {
     cJSON* root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "asset", cfg->key);
     cJSON_AddStringToObject(root, "name", cfg->name);
-    cJSON_AddStringToObject(root, "ticker", cfg->ticker);
+    cJSON_AddStringToObject(root, "ticker", ticker_used.c_str());
     cJSON_AddNumberToObject(root, "price", price);
     cJSON_AddNumberToObject(root, "bars", (double)closes.size());
 
@@ -907,7 +951,7 @@ bool RunCycle(const AssetConfig* cfg, std::string& report, std::string& error) {
     cJSON_Delete(root);
 
     ESP_LOGI(TAG, "%s (%s) price %.*f, score %+d, action %s",
-             cfg->name, cfg->ticker, dec, price, score, action);
+             cfg->name, ticker_used.c_str(), dec, price, score, action);
 
     NotifyTrade(cfg, action, score, price, pnl_pct, pnl_usd, hold_time_min, state);
 
@@ -933,7 +977,14 @@ bool MarketNotifier::ResolveAsset(const std::string& asset,
         }
     }
 
-    error = "unknown asset '" + asset + "', use 'gold' or 'btc'";
+    // Build the list from the table so the hint can never drift out of sync
+    // with the assets that actually exist.
+    std::string keys;
+    for (size_t i = 0; i < kAssetCount; i++) {
+        if (i > 0) keys += ", ";
+        keys += kAssets[i].key;
+    }
+    error = "unknown asset '" + asset + "', use one of: " + keys;
     return false;
 }
 

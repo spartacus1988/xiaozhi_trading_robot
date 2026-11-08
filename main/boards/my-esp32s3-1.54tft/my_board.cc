@@ -1336,11 +1336,13 @@ public:
         // Not part of the upstream board: the market notifier is a C++ port of
         // https://github.com/spartacus1988/Gold_and_crypto_notifyer (main.py).
         mcp_server.AddTool("self.market.analyze",
-            "Analyze the gold or Bitcoin market: download fresh candles from Yahoo Finance, "
+            "Analyze the gold or crypto market: download fresh candles from Yahoo Finance, "
             "compute technical indicators (RSI, MACD, EMA, ATR, ADX, Bollinger, volume), "
             "reduce them to an overall score and run one cycle of the trading bot.\n"
             "Args:\n"
-            "  `asset`: `gold` (Gold futures, GC=F) or `btc` (Bitcoin). Defaults to `btc`.\n"
+            "  `asset`: one of `gold` (Gold futures, GC=F), `btc` (Bitcoin), `eth` "
+            "(Ethereum), `ltc` (Litecoin), `doge` (Dogecoin) or `trump` (Official "
+            "Trump). Defaults to `btc`.\n"
             "Returns: a JSON object with:\n"
             "  - price and per-indicator values with a short reading;\n"
             "  - `score` from -6 (strong bearish) to +6 (strong bullish) and a `verdict`;\n"
@@ -1348,7 +1350,8 @@ public:
             "TIME_EXIT or WAIT), message, cash, position and total equity.\n"
             "The bot state is persisted on the device, so calling this tool can open or "
             "close a position and change the balance. Use it when the user asks for the "
-            "gold/Bitcoin price, the current market signal or the bot's portfolio.",
+            "gold/Bitcoin/ETH/LTC/DOGE/TRUMP price, the current market signal or the "
+            "bot's portfolio.",
             PropertyList({
                 Property("asset", kPropertyTypeString, std::string("btc"))
             }),
@@ -1371,7 +1374,8 @@ public:
             "position state are not, they survive in flash.\n"
             "Args:\n"
             "  `action`: `start` (default), `stop` or `status`.\n"
-            "  `asset`: `gold` or `btc`, used by `start`. Defaults to `btc`.\n"
+            "  `asset`: `gold`, `btc`, `eth`, `ltc`, `doge` or `trump`, used by `start`. "
+            "Defaults to `btc`.\n"
             "  `interval_sec`: polling period for `start`, 10-3600 seconds, "
             "defaults to 60.\n"
             "Returns: for `start` the first full analysis report plus a `monitor` "
